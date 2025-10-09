@@ -1,6 +1,6 @@
-﻿namespace torra_watch.UI
+﻿namespace torra_watch.UI.Controls
 {
-    partial class LogPanel
+    partial class SettingsPanel
     {
         /// <summary> 
         /// Required designer variable.

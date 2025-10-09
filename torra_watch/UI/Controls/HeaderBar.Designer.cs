@@ -1,6 +1,6 @@
-﻿namespace torra_watch.UI.Controler
+﻿namespace torra_watch.UI.Controls
 {
-    partial class AccountPanel
+    partial class HeaderBar
     {
         /// <summary> 
         /// Required designer variable.
@@ -29,7 +29,7 @@
         private void InitializeComponent()
         {
             components = new System.ComponentModel.Container();
-            //this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
+            this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
         }
 
         #endregion

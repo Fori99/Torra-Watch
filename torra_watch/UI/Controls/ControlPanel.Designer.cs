@@ -1,6 +1,6 @@
-﻿namespace torra_watch.UI
+﻿namespace torra_watch.UI.Controls
 {
-    partial class TickersList
+    partial class ControlPanel
     {
         /// <summary> 
         /// Required designer variable.

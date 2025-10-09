@@ -17,4 +17,12 @@
     <PackageReference Include="System.Text.Json" Version="9.0.9" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="UI\Controls\" />
+    <Folder Include="UI\Layout\" />
+    <Folder Include="UI\Assets\" />
+    <Folder Include="UI\Services\" />
+    <Folder Include="UI\UiThem\" />
+  </ItemGroup>
+
 </Project>
