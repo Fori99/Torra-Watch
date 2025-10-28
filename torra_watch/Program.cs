@@ -1,9 +1,11 @@
-using System;
+﻿using System;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Windows.Forms;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.VisualBasic.Logging;
 using torra_watch.Core;
 using torra_watch.Exchange;
 
@@ -16,32 +18,37 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
 
-        // ---- Runtime config (edit here) ----
-        var exCfg = new ExchangeConfig
-        {
-            UseBinance = true,       // true => use Binance HTTP adapter, false => PaperExchange
-            ReadOnly = false,      // false => place orders; true => never place orders
-            UseTestnet = false,      // testnet (testnet.binance.vision)
-            UseDemo = true,       // demo (demo-api.binance.com)
-            QuoteAsset = "USDT",
-            ApiKey = Environment.GetEnvironmentVariable("TORRA_BINANCE_KEY"),
-            ApiSecret = Environment.GetEnvironmentVariable("TORRA_BINANCE_SECRET")
-        };
+        // ---- Load app settings (persisted JSON) ----
+        var settings = BotSettings.LoadOrDefault();
 
-        // Safety: if orders are enabled but keys are missing, force ReadOnly.
-        if (exCfg.UseBinance && !exCfg.ReadOnly &&
+        // ---- Build exchange config from settings + env-vars ----
+        var exCfg = ExchangeFactory.Build(settings);
+
+        // Safety: if trading is enabled but keys are missing, force ReadOnly.
+        if (!settings.ReadOnly &&
             (string.IsNullOrWhiteSpace(exCfg.ApiKey) || string.IsNullOrWhiteSpace(exCfg.ApiSecret)))
         {
-            exCfg.ReadOnly = true;
+            settings.ReadOnly = true;
+            // Persist the safeguard so UI reflects it.
+            settings.Save();
         }
+
+        // ---- Global unhandled exception hook (last-resort logging) ----
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+        {
+            var ex = e.ExceptionObject as Exception;
+            var msg = ex?.ToString() ?? "Unknown fatal error";
+            //try { Log.Error($"UNHANDLED: {msg}"); } catch { /* ignore */ }
+        };
 
         using var host = Host.CreateDefaultBuilder()
             .ConfigureServices(services =>
             {
-                // Config
+                // Settings & configs
+                services.AddSingleton(settings);
                 services.AddSingleton(exCfg);
 
-                // Shared HttpClient (gzip, sensible timeout)
+                // Shared HttpClient (gzip/deflate, sensible timeout, UA)
                 services.AddSingleton<HttpClient>(_ =>
                 {
                     var handler = new HttpClientHandler
@@ -55,33 +62,40 @@ internal static class Program
                     };
                     client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
                     client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("deflate"));
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd("TorraWatch/1.0 (+https://local.app)");
+                    client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
                     return client;
                 });
 
-                // Exchange adapter
-                if (exCfg.UseBinance)
-                    services.AddSingleton<IExchange, BinanceHttpExchange>();
-                else
-                    services.AddSingleton<IExchange, PaperExchange>();
+                // ---- Exchange adapter ----
+                // If you add a PaperExchange later, branch here based on a setting.
+                //services.AddSingleton<IExchange, BinanceHttpExchange>();
 
-                // Core services
+                // ---- Core services you already had ----
                 services.AddSingleton<RankingService>();
+
+                // Map StrategyConfig from BotSettings (pct → decimal)
                 services.AddSingleton(new StrategyConfig
                 {
-                    UniverseSize = 150,
-                    MinDrop3hPct = -0.04m,                       // <= -4% over last 3h
-                    TakeProfitPct = 0.02m,                       // +2%
-                    StopLossPct = 0.02m,                         // -2%
-                    TimeStopHours = 6.0,                         // time-based exit
-                    CooldownWhenNoCandidate = TimeSpan.FromHours(1)
+                    UniverseSize = settings.TopN,
+                    // Your engine expects a negative drop decimal (e.g., -0.04m for -4%):
+                    MinDrop3hPct = -(settings.DropThresholdPct / 100m),
+                    TakeProfitPct = (settings.TpPct / 100m),
+                    StopLossPct = (settings.SlPct / 100m),
+                    TimeStopHours = Math.Max(0.0, settings.MaxHoldingMinutes / 60.0),
+                    CooldownWhenNoCandidate = TimeSpan.FromMinutes(settings.SymbolCooldownMin)
                 });
-                services.AddSingleton<DecisionEngine>();
-                services.AddSingleton<Trader>();
 
-                // UI
+                services.AddSingleton<DecisionEngine>();
+                // services.AddSingleton<Trader>(); // enable when you add it
+
+                // ---- UI ----
                 services.AddSingleton<MainForm>();
             })
             .Build();
+
+        // First log line (so we have a boot marker)
+        //Log.Info($"Startup | mode={settings.Mode} readOnly={settings.ReadOnly} quote={settings.QuoteAsset}");
 
         Application.Run(host.Services.GetRequiredService<MainForm>());
     }

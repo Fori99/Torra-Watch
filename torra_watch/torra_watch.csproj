@@ -9,20 +9,21 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="UI\Assets\**" />
+    <Compile Remove="UI\UiThem\**" />
+    <EmbeddedResource Remove="UI\Assets\**" />
+    <EmbeddedResource Remove="UI\UiThem\**" />
+    <None Remove="UI\Assets\**" />
+    <None Remove="UI\UiThem\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Binance.Net" Version="11.7.1" />
     <PackageReference Include="CryptoExchange.Net" Version="9.7.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.9" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.9" />
     <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="9.0.9" />
     <PackageReference Include="System.Text.Json" Version="9.0.9" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Folder Include="UI\Controls\" />
-    <Folder Include="UI\Layout\" />
-    <Folder Include="UI\Assets\" />
-    <Folder Include="UI\Services\" />
-    <Folder Include="UI\UiThem\" />
   </ItemGroup>
 
 </Project>

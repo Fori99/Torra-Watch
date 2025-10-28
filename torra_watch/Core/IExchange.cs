@@ -18,5 +18,8 @@ public interface IExchange
     // Trading rules for symbol (qty step, min notional)
     Task<(decimal stepSize, decimal minNotional)> GetSymbolRulesAsync(string symbol, CancellationToken ct = default);
 
+    //Account Details
+    Task<AccountSnapshotUsdt> GetAccountSnapshotUsdtAsync(CancellationToken ct = default);
+
 
 }

@@ -1,510 +1,344 @@
 ﻿using System;
 using System.Drawing;
 using System.Linq;
-using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using torra_watch.Core;
-using torra_watch.UI;
-using AccountPanel = torra_watch.UI.Controler.AccountPanel;
-using HeaderBar = torra_watch.UI.Controler.HeaderBar;
-using LogPanel = torra_watch.UI.Controler.LogPanel;
-using TickersList = torra_watch.UI.Controler.TickersList;
+using torra_watch.Services;
+using torra_watch.UI.Controls;
+using torra_watch.UI.ViewModels;
 
 namespace torra_watch
 {
     public partial class MainForm : Form
     {
-        private readonly IExchange _ex;
-        private readonly RankingService _ranking;
-        private readonly DecisionEngine _engine;
-        private readonly Trader _trader;
-        private readonly StrategyConfig _cfg;
+        // ---------------- Services & config ----------------
+        private readonly BotSettings _settings = BotSettings.LoadOrDefault();
 
-        // --- Figma-like shell ---
-        private HeaderBar _header;
-        private TickersList _tickers;
-        private LogPanel _logPanel;
-        private AccountPanel _acctPanel;
-        private TableLayoutPanel _root;
+        private readonly CancellationTokenSource _cts = new();
+        private readonly IMarketDataService _market;
+        private readonly ISettingsService _settingsSvc;
+        private StrategyConfigVM _cfg;
 
-        // settings controls (same instances you had)
-        private readonly GroupBox _gbSettings = new() { Text = "Settings", Dock = DockStyle.Fill };
-        private readonly NumericUpDown _numUniverse = new() { Minimum = 50, Maximum = 500, Increment = 10, Width = 90 };
-        private readonly NumericUpDown _numDrop3h = new() { Minimum = -50, Maximum = 0, DecimalPlaces = 1, Increment = 0.1M, Width = 90 };
-        private readonly NumericUpDown _numTP = new() { Minimum = 0.1M, Maximum = 10, DecimalPlaces = 1, Increment = 0.1M, Width = 90 };
-        private readonly NumericUpDown _numSL = new() { Minimum = 0.1M, Maximum = 10, DecimalPlaces = 1, Increment = 0.1M, Width = 90 };
-        private readonly NumericUpDown _numTimeStop = new() { Minimum = 0.5M, Maximum = 24, DecimalPlaces = 1, Increment = 0.5M, Width = 90 };
-        private readonly Button _btnApplySettings = new() { Text = "Apply", Height = 30, Width = 90, Dock = DockStyle.Right };
+        // ---------------- UI fields (promoted from locals) ----------------
+        private TopCoinsListControl _topCoins;
+        private ControlPanelControl _controlPanel;
+        private SettingsPanelControl _settingsPanel;
+        private StatusCardControl _statusCard;
+        private SystemLogsControl _systemLogs;
+        private PriceChartControl _priceChart;
 
-        // debug viewer (shown in Account panel on demand)
-        private readonly RichTextBox _acctDebug = new()
+        // ---------------- UI style tokens ----------------
+        private static class Ui
         {
-            Dock = DockStyle.Fill,
-            ReadOnly = true,
-            WordWrap = false,
-            DetectUrls = false,
-            Font = new Font(FontFamily.GenericMonospace, 9f),
-            Visible = false,
-            BackColor = UiTheme.Bg3,
-            ForeColor = UiTheme.Text,
-            BorderStyle = BorderStyle.None
-        };
+            public static readonly Color AppBg = Color.FromArgb(245, 247, 250);
+            public static readonly Color MutedText = Color.FromArgb(100, 107, 114);
+            public static readonly Color SecondaryText = Color.FromArgb(116, 124, 133);
+            public const float TitleFontSize = 9f;
+            public const float BodyFontSize = 9.5f;
 
-        // loop state
-        private CancellationTokenSource? _cts;
-        private DateTime? _nextCheckUtc;
+            public static Padding OuterPadding => new(10);
+            public static Padding CardMargin => new(6);
+            public static Padding CardBodyPadding => new(10);
+            public static Padding SectionPadding => new(8);
+        }
 
-        public MainForm(IExchange ex, RankingService ranking, DecisionEngine engine, Trader trader, StrategyConfig cfg)
+        public MainForm()
         {
-            _ex = ex; _ranking = ranking; _engine = engine; _trader = trader; _cfg = cfg;
-
             InitializeComponent();
-            Text = "Torra Watch — UI";
+            BuildDashboardShell();
+
+            var http = new HttpClient(); // single shared instance
+            _market = new BinanceMarketDataService(http);
+            _settingsSvc = new JsonSettingsService();
+            _cfg = _settingsSvc.Load();
+
+            // Bind settings panel
+            _settingsPanel.LoadFrom(_cfg);
+            _settingsPanel.SaveRequested += (_, vm) =>
+            {
+                var result = StrategyConfigValidator.Validate(vm);
+                if (!result.Ok)
+                {
+                    MessageBox.Show(string.Join(Environment.NewLine, result.Errors),
+                        "Invalid settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // Persist and reflect in memory
+                StrategyConfigMapper.ApplyToSettings(vm, _settings);
+                _settings.Save();
+                _cfg = vm;
+
+                MessageBox.Show("Settings saved.", "OK", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
+
+            // Control panel events
+            _controlPanel.StartRequested += async (_, __) =>
+            {
+                await RefreshTopCoins(); // immediate first run
+                StartTimers();
+                _statusCard.SetRunning(true);
+            };
+            _controlPanel.StopRequested += (_, __) =>
+            {
+                StopTimers();
+                _statusCard.SetRunning(false);
+            };
+            _controlPanel.PanicRequested += (_, __) => MessageBox.Show("PANIC!");
+
+            // Top coins row click -> chart
+            _topCoins.SymbolSelected += symbol => LoadChart(symbol);
+        }
+
+        // ---------------- Layout ----------------
+        private void BuildDashboardShell()
+        {
+            Text = "TorraWatch";
+            BackColor = Ui.AppBg;
             WindowState = FormWindowState.Maximized;
 
-            BuildShell();
-            WireHeaderEvents();
-
-            // settings UI into header settings slot
-            AddSettingsToHeader();
-
-            // grid columns
-            _tickers.ConfigureColumns(_cfg);
-
-            // initial values
-            _numUniverse.Value = _cfg.UniverseSize;
-            _numDrop3h.Value = (decimal)(_cfg.MinDrop3hPct * 100m);
-            _numTP.Value = (decimal)(_cfg.TakeProfitPct * 100m);
-            _numSL.Value = (decimal)(_cfg.StopLossPct * 100m);
-            _numTimeStop.Value = (decimal)_cfg.TimeStopHours;
-
-            Shown += async (_, __) =>
+            var grid = new TableLayoutPanel
             {
-                try
-                {
-                    AppendLog("Init refresh…");
-                    await RefreshTickersAsync();
-                    await RefreshEquityAsync();
-                    await RefreshEnvStatusAsync();
-                    await RefreshAccountSummaryAsync(); // light summary on the account card
-                    AppendLog("Init done.");
-                }
-                catch (Exception ex)
-                {
-                    AppendLog("Init error: " + ex.Message);
-                    MessageBox.Show(ex.ToString(), "Init Error");
-                }
+                Dock = DockStyle.Fill,
+                BackColor = Color.Transparent,
+                ColumnCount = 4,
+                RowCount = 3,
+                Padding = Ui.OuterPadding
             };
+            for (int i = 0; i < 4; i++) grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+            grid.RowStyles.Add(new RowStyle(SizeType.Percent, 30));
+            grid.RowStyles.Add(new RowStyle(SizeType.Percent, 35));
+            grid.RowStyles.Add(new RowStyle(SizeType.Percent, 35));
+            Controls.Add(grid);
 
-            EnableDoubleBuffer(_tickers.Grid);
+            // LEFT: Top Coins (spans all rows)
+            var topCoinsCard = BuildTopCoinsSection();
+            grid.Controls.Add(topCoinsCard, 0, 0);
+            grid.SetRowSpan(topCoinsCard, 3);
+
+            // ROW 0: Control Panel, Settings, Status
+            var (controlPanelCard, settingsCard, statusCard) = BuildRow0_ControlsSettingsStatus();
+            grid.Controls.Add(controlPanelCard, 1, 0);
+            grid.Controls.Add(settingsCard, 2, 0);
+            grid.Controls.Add(statusCard, 3, 0);
+
+            // ROW 1: Logs + Account
+            var logsCard = MakeCard("System Logs", "");
+            _systemLogs = new SystemLogsControl { Dock = DockStyle.Fill };
+            ReplaceCardBody(logsCard, _systemLogs);
+            grid.Controls.Add(logsCard, 1, 1);
+            grid.SetColumnSpan(logsCard, 2);
+
+            var accountCard = MakeCard("Account Details", "");
+            var account = new AccountPanelControl { Dock = DockStyle.Fill };
+            account.Demo();
+            ReplaceCardBody(accountCard, account);
+            grid.Controls.Add(accountCard, 3, 1);
+
+            // ROW 2: Trading Overview (orders + chart)
+            var overviewCard = BuildRow2_TradingOverview();
+            grid.Controls.Add(overviewCard, 1, 2);
+            grid.SetColumnSpan(overviewCard, 3);
         }
 
-        // ========================= LAYOUT =========================
-
-        private void BuildShell()
+        private (CardFrameControl, CardFrameControl, CardFrameControl) BuildRow0_ControlsSettingsStatus()
         {
-            _header = new HeaderBar();
-            _tickers = new TickersList();
-            _logPanel = new LogPanel();
-            _acctPanel = new AccountPanel();
+            // Control Panel
+            var controlPanelCard = MakeCard("Control Panel", "");
+            _controlPanel = new ControlPanelControl { Dock = DockStyle.Fill };
+            ReplaceCardBody(controlPanelCard, _controlPanel);
 
-            // ==== Put your Figma percentages here ====
-            var leftPct = 28f;    // tickers
-            var middlePct = 44f;  // logs (and future chart)
-            var rightPct = 28f;   // account + settings
-            var gapPct = 1f;
-            // ========================================
+            // Settings
+            var settingsCard = MakeCard("Settings", "");
+            _settingsPanel = new SettingsPanelControl { Dock = DockStyle.Fill };
+            ReplaceCardBody(settingsCard, _settingsPanel);
 
-            _root = new TableLayoutPanel
+            // Status
+            var statusCard = MakeCard("Status", "");
+            _statusCard = new StatusCardControl { Dock = DockStyle.Fill };
+            _statusCard.SetStatus(new BotStatusVM
             {
-                Dock = DockStyle.Fill,
-                ColumnCount = 5,
-                RowCount = 2,
-                Padding = new Padding(16)
-            };
-            _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
-
-            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, leftPct));
-            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, gapPct));
-            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, middlePct));
-            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, gapPct));
-            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, rightPct));
-
-            Controls.Clear();
-            Controls.Add(_root);
-
-            // header
-            _root.Controls.Add(_header, 0, 0);
-            _root.SetColumnSpan(_header, 5);
-
-            // main content
-            _root.Controls.Add(_tickers, 0, 1);
-            _root.Controls.Add(new Panel { Dock = DockStyle.Fill }, 1, 1);
-            _root.Controls.Add(_logPanel, 2, 1);
-            _root.Controls.Add(new Panel { Dock = DockStyle.Fill }, 3, 1);
-
-            // right column: a vertical split (Account summary on top, Settings below)
-            var right = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2 };
-            right.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-            right.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-
-            // Account card gets a small summary area + hidden debug box overlay
-            var acctWrap = new Panel { Dock = DockStyle.Fill };
-            acctWrap.Controls.Add(_acctPanel);
-            acctWrap.Controls.Add(_acctDebug); // toggled visible by Account/Orders buttons
-            right.Controls.Add(acctWrap, 0, 0);
-
-            // Settings card already styled via HeaderBar slot (we place a “proxy” below for symmetry)
-            var settingsProxy = new CardPanel { Dock = DockStyle.Fill };
-            settingsProxy.Controls.Add(new Label
-            {
-                Text = "Settings → in header",
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleCenter,
-                ForeColor = UiTheme.TextDim
+                Primary = BotPrimaryStatus.Running,
+                Step = BotCycleStep.SortByChange,
+                LookbackHours = Math.Max(1, _settings.LookbackMinutes / 60),
+                SecondWorstMinDropPct = _settings.DropThresholdPct,
+                TpPct = _settings.TpPct,
+                SlPct = _settings.SlPct,
+                Mode = _settings.Mode.ToString(),
+                Exchange = "Binance",
+                Connected = true,
+                Uptime = TimeSpan.FromMinutes(12)
             });
-            right.Controls.Add(settingsProxy, 0, 1);
+            ReplaceCardBody(statusCard, _statusCard);
 
-            _root.Controls.Add(right, 4, 1);
+            return (controlPanelCard, settingsCard, statusCard);
         }
 
-        private void AddSettingsToHeader()
+        private CardFrameControl BuildTopCoinsSection()
         {
-            var sp = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(8) };
-            sp.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            sp.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var topCoinsCard = MakeCard("Top Coins", "");
+            topCoinsCard.BorderColor = Color.FromArgb(239, 240, 242);
+            topCoinsCard.BorderThickness = 1;
+            topCoinsCard.CornerRadius = 0;
 
-            sp.Controls.Add(new Label { Text = "Universe", AutoSize = true }, 0, 0); sp.Controls.Add(_numUniverse, 1, 0);
-            sp.Controls.Add(new Label { Text = "Min drop 3h (%)", AutoSize = true }, 0, 1); sp.Controls.Add(_numDrop3h, 1, 1);
-            sp.Controls.Add(new Label { Text = "TP (%)", AutoSize = true }, 0, 2); sp.Controls.Add(_numTP, 1, 2);
-            sp.Controls.Add(new Label { Text = "SL (%)", AutoSize = true }, 0, 3); sp.Controls.Add(_numSL, 1, 3);
-            sp.Controls.Add(new Label { Text = "Time-stop (h)", AutoSize = true }, 0, 4); sp.Controls.Add(_numTimeStop, 1, 4);
-            sp.Controls.Add(_btnApplySettings, 1, 5);
+            _topCoins = new TopCoinsListControl { Dock = DockStyle.Fill };
+            _topCoins.SetWindowHours(Math.Max(1, _settings.LookbackMinutes / 60));
+            _topCoins.SetCoins(SeedDemoTopCoins(), Math.Max(1, _settings.LookbackMinutes / 60));
 
-            _header.SettingsBox.Controls.Clear();
-            _header.SettingsBox.Controls.Add(sp);
+            ReplaceCardBody(topCoinsCard, _topCoins);
+            return topCoinsCard;
         }
 
-        // ========================= THEME HELPERS =========================
+        private CardFrameControl BuildRow2_TradingOverview()
+        {
+            var overview = new CardFrameControl
+            {
+                Dock = DockStyle.Fill,
+                Title = "Trading Overview",
+                Margin = Ui.SectionPadding
+            };
 
-        private static void EnableDoubleBuffer(DataGridView grid)
+            var inner = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                RowCount = 1,
+                Padding = Ui.SectionPadding,
+                BackColor = Color.Transparent
+            };
+            inner.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.3333f));
+            inner.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.3333f));
+            inner.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.3333f));
+            inner.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            overview.Body.Controls.Clear();
+            overview.Body.Controls.Add(inner);
+
+            // LEFT: Live Orders
+            var ordersCard = MakeHeaderlessCard("Live Orders", out var ordersHeaderLabel);
+            var liveOrders = new LiveOrdersListControl { Dock = DockStyle.Fill, ShowHeader = false };
+            liveOrders.Demo();
+            ordersCard.Body.Controls.Add(liveOrders);
+            ordersCard.Body.Controls.Add(ordersHeaderLabel);
+            inner.Controls.Add(ordersCard, 0, 0);
+
+            // MIDDLE+RIGHT: Chart
+            var chartCard = MakeHeaderlessCard("Price Chart", out var chartHeaderLabel, margin: new Padding(8, 0, 0, 0));
+            _priceChart = new PriceChartControl { Dock = DockStyle.Fill };
+            chartCard.Body.Controls.Add(_priceChart);
+            chartCard.Body.Controls.Add(chartHeaderLabel);
+            inner.Controls.Add(chartCard, 1, 0);
+            inner.SetColumnSpan(chartCard, 2);
+
+            return overview;
+        }
+
+        // ---------------- Helpers ----------------
+        private static CardFrameControl MakeCard(string title, string placeholder)
+        {
+            var card = new CardFrameControl { Dock = DockStyle.Fill, Title = title, Margin = Ui.CardMargin };
+            var label = new Label
+            {
+                AutoSize = true,
+                Dock = DockStyle.Top,
+                Text = placeholder,
+                Font = new Font("Segoe UI", Ui.BodyFontSize),
+                ForeColor = Color.FromArgb(90, 100, 110),
+                Padding = new Padding(4, 2, 4, 8),
+                TextAlign = ContentAlignment.TopLeft
+            };
+            card.Body.Padding = Ui.CardBodyPadding;
+            card.Body.Controls.Add(label);
+            return card;
+        }
+
+        private static CardFrameControl MakeHeaderlessCard(string titleText, out Label headerLabel, Padding? margin = null)
+        {
+            var card = new CardFrameControl { Dock = DockStyle.Fill, HeaderVisible = false, Margin = margin ?? Padding.Empty };
+            headerLabel = new Label
+            {
+                Text = titleText,
+                Dock = DockStyle.Top,
+                Height = 22,
+                Padding = new Padding(0, 0, 0, 6),
+                Font = new Font("Segoe UI Semibold", Ui.TitleFontSize),
+                ForeColor = Ui.SecondaryText
+            };
+            card.Body.Padding = Ui.CardBodyPadding;
+            return card;
+        }
+
+        private static void ReplaceCardBody(CardFrameControl card, Control content)
+        {
+            card.Body.Controls.Clear();
+            content.Dock = DockStyle.Fill;
+            card.Body.Controls.Add(content);
+        }
+
+        private static TopCoinVM[] SeedDemoTopCoins() => new[]
+        {
+            new TopCoinVM { Symbol = "BTC",  Price = 42150m, ChangePct =  2.5m },
+            new TopCoinVM { Symbol = "ETH",  Price =  2250m, ChangePct =  1.8m },
+            new TopCoinVM { Symbol = "BNB",  Price =   312m, ChangePct = -0.5m },
+            new TopCoinVM { Symbol = "SOL",  Price =    98m, ChangePct =  5.2m },
+            new TopCoinVM { Symbol = "XRP",  Price =   0.6m, ChangePct =  0.7m },
+            new TopCoinVM { Symbol = "ADA",  Price =  0.52m, ChangePct =  0.8m },
+            new TopCoinVM { Symbol = "DOGE", Price =  0.12m, ChangePct =  1.1m },
+            new TopCoinVM { Symbol = "LTC",  Price =     78m, ChangePct =  0.4m },
+            new TopCoinVM { Symbol = "DOT",  Price =    6.2m, ChangePct =  1.6m },
+            new TopCoinVM { Symbol = "AVAX", Price =     25m, ChangePct = -0.9m },
+        };
+
+        // ---------------- Timers ----------------
+        private System.Windows.Forms.Timer? _scanTimer;
+        private void StartTimers()
+        {
+            _scanTimer ??= new System.Windows.Forms.Timer { Interval = 60_000 };
+            _scanTimer.Tick -= ScanTick;
+            _scanTimer.Tick += ScanTick;
+            _scanTimer.Start();
+        }
+        private void StopTimers() => _scanTimer?.Stop();
+        private async void ScanTick(object? s, EventArgs e) => await RefreshTopCoins();
+
+        // ---------------- Data pushes ----------------
+        private async Task RefreshTopCoins()
         {
             try
             {
-                typeof(DataGridView).InvokeMember("DoubleBuffered",
-                    System.Reflection.BindingFlags.NonPublic |
-                    System.Reflection.BindingFlags.Instance |
-                    System.Reflection.BindingFlags.SetProperty,
-                    null, grid, new object[] { true });
-            }
-            catch { }
-        }
+                var lookbackHours = Math.Max(1, _settings.LookbackMinutes / 60);
+                var lookback = TimeSpan.FromHours(lookbackHours);
 
-        // ========================= REFRESHERS =========================
+                var movers = await _market.GetTopMoversAsync(_cfg.UniverseSize, lookback, _cts.Token);
+                var vms = movers.Select(m => new TopCoinVM
+                {
+                    Symbol = m.Symbol,
+                    Price = m.Now,
+                    ChangePct = m.ChangePct
+                }).ToArray();
 
-        private async System.Threading.Tasks.Task RefreshTickersAsync()
-        {
-            var data = await _ranking.BuildAsync(_cfg.UniverseSize);
-            _tickers.Bind(data);
-        }
-
-        private async System.Threading.Tasks.Task RefreshAccountSummaryAsync()
-        {
-            try
-            {
-                var eq = await _ex.GetEquityAsync();
-                // show a minimal summary in the Account card’s header text
-                // (If you want lines like “Available / In Orders”, add labels in AccountPanel)
-                _acctPanel.SetText($"// Account summary\nEquity (quote): {eq:0,0.00}");
-                _acctDebug.Visible = false; // keep debug hidden until user clicks Account/Orders
+                void Apply() => _topCoins.SetCoins(vms, lookbackHours);
+                if (InvokeRequired) BeginInvoke((Action)Apply); else Apply();
             }
             catch (Exception ex)
             {
-                _acctPanel.SetText($"Account: n/a ({ex.Message})");
+                _systemLogs?.Append($"❌ RefreshTopCoins: {ex.Message}");
             }
         }
 
-        private async System.Threading.Tasks.Task RefreshEquityAsync()
+        private async void LoadChart(string symbol)
         {
             try
             {
-                var eq = await _ex.GetEquityAsync();
-                _header.Equity.Font = UiTheme.H1;
-                _header.Equity.ForeColor = UiTheme.Accent;
-                _header.Equity.Text = $"Equity: {eq:0,0.00}";
-            }
-            catch
-            {
-                _header.Equity.Text = "Equity: n/a";
-                _header.Equity.ForeColor = UiTheme.TextDim;
-                _header.Equity.Font = UiTheme.H2;
-            }
-        }
-
-        private async System.Threading.Tasks.Task RefreshEnvStatusAsync()
-        {
-            try
-            {
-                if (_ex is Exchange.BinanceHttpExchange http)
-                {
-                    var snap = await http.GetEnvSnapshotAsync();
-                    var balances = snap.balances.Count == 0
-                        ? "balances: n/a"
-                        : string.Join(", ", snap.balances.Select(b => $"{b.Asset}:{(b.Free + b.Locked):0.####}"));
-                    _header.Env.Text = $"Env: {snap.env} | Pub: {snap.publicHost} | Priv: {snap.privateHost} | Keys: {(snap.keysLoaded ? "yes" : "no")} | {balances}";
-                }
-                else
-                {
-                    _header.Env.Text = "Env: PAPER";
-                }
+                var candles = await _market.GetKlinesAsync(symbol, "1m", 180, _cts.Token);
+                void Apply() => _priceChart.Draw(symbol, candles);
+                if (InvokeRequired) BeginInvoke((Action)Apply); else Apply();
             }
             catch (Exception ex)
             {
-                _header.Env.Text = $"Env: error — {ex.Message}";
+                _systemLogs?.Append($"❌ LoadChart: {ex.Message}");
             }
-        }
-
-        // ========================= EVENTS / ACTIONS =========================
-
-        private void WireHeaderEvents()
-        {
-            _btnApplySettings.Click += (_, __) => ApplySettings();
-
-            _header.BtnStart.Click += (_, __) => { AppendLog("Start clicked"); StartLoop(); };
-            _header.BtnStop.Click += (_, __) => { AppendLog("Stop clicked"); StopLoop(); };
-            _header.BtnCheck.Click += async (_, __) => { AppendLog("Check clicked"); await CheckOnceAsync(); };
-            _header.BtnPanic.Click += async (_, __) => { AppendLog("Panic clicked"); await PanicCloseAsync(); };
-            _header.BtnAcct.Click += async (_, __) => { AppendLog("Account clicked"); await ShowAccountDebugAsync(); };
-            _header.BtnOrders.Click += async (_, __) => { AppendLog("Orders clicked"); await ShowOrdersForSelectionAsync(); };
-        }
-
-        private void ApplySettings()
-        {
-            _cfg.UniverseSize = (int)_numUniverse.Value;
-            _cfg.MinDrop3hPct = _numDrop3h.Value / 100m;
-            if (_cfg.MinDrop3hPct > 0m) _cfg.MinDrop3hPct = -_cfg.MinDrop3hPct;
-            _cfg.TakeProfitPct = _numTP.Value / 100m;
-            _cfg.StopLossPct = _numSL.Value / 100m;
-            _cfg.TimeStopHours = (double)_numTimeStop.Value;
-
-            AppendLog($"Settings applied: N={_cfg.UniverseSize}, 3h≤{_cfg.MinDrop3hPct:P1}, TP={_cfg.TakeProfitPct:P1}, SL={_cfg.StopLossPct:P1}, TS={_cfg.TimeStopHours:0.0}h");
-            _ = RefreshTickersAsync();
-            _ = RefreshEnvStatusAsync();
-        }
-
-        private void AppendLog(string msg) =>
-            _logPanel.Append($"[{DateTime.Now:HH:mm:ss}] {msg}");
-
-        private async System.Threading.Tasks.Task ShowAccountDebugAsync()
-        {
-            try
-            {
-                if (_ex is Exchange.BinanceHttpExchange http)
-                {
-                    var json = await http.DebugAccountRawAsync();
-                    _acctDebug.Text = PrettyJson(json);
-                    _acctDebug.Visible = !_acctDebug.Visible; // toggle
-                }
-            }
-            catch (Exception ex)
-            {
-                _acctDebug.Text = $"Account error: {ex.Message}";
-                _acctDebug.Visible = true;
-            }
-        }
-
-        private async System.Threading.Tasks.Task ShowOrdersForSelectionAsync()
-        {
-            try
-            {
-                var symbol = "BTCUSDT";
-                if (_tickers.Grid.CurrentRow?.DataBoundItem is RankingRow rr && !string.IsNullOrWhiteSpace(rr.Symbol))
-                    symbol = rr.Symbol;
-
-                if (_ex is Exchange.BinanceHttpExchange http)
-                {
-                    var open = await http.DebugOpenOrdersRawAsync(symbol);
-                    var recent = await http.DebugAllOrdersRawAsync(symbol);
-                    _acctDebug.Text = $"// Open Orders ({symbol})\n{PrettyJson(open)}\n\n// All Orders ({symbol})\n{PrettyJson(recent)}";
-                    _acctDebug.Visible = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                _acctDebug.Text = $"Orders error: {ex.Message}";
-                _acctDebug.Visible = true;
-            }
-        }
-
-        // ========================= CHECK / LOOP =========================
-
-        private async System.Threading.Tasks.Task CheckOnceAsync()
-        {
-            _header.State.Text = "State: Checking…";
-            await RefreshTickersAsync();
-
-            var decision = await _engine.DecideAsync();
-            if (decision.kind == DecisionKind.CandidateFound && !string.IsNullOrWhiteSpace(decision.symbol))
-            {
-                _header.State.Text = $"State: Candidate → {decision.symbol} ({(decision.ret3h.GetValueOrDefault() * 100m):0.00}% 3h)";
-                _header.Next.Text = "Next check: asap";
-                AppendLog($"Candidate found: {decision.symbol} ({decision.ret3h.GetValueOrDefault():P2})");
-            }
-            else
-            {
-                _nextCheckUtc = decision.nextCheckUtc;
-                _header.State.Text = "State: Cooldown";
-                UpdateNextLabel();
-                AppendLog(decision.note);
-            }
-        }
-
-        private void StartLoop()
-        {
-            if (_cts != null) return;
-            _cts = new System.Threading.CancellationTokenSource();
-            _header.BtnStart.Enabled = false; _header.BtnStop.Enabled = true;
-            AppendLog("Loop started.");
-            _ = TradeLoopAsync(_cts.Token);
-        }
-
-        private void StopLoop()
-        {
-            _cts?.Cancel();
-            _cts = null;
-            _header.BtnStart.Enabled = true; _header.BtnStop.Enabled = false;
-            _header.State.Text = "State: Idle"; _header.Next.Text = "Next check: —";
-            AppendLog("Loop stopped.");
-        }
-
-        private async System.Threading.Tasks.Task PanicCloseAsync()
-        {
-            AppendLog("Panic Close requested — ensure adapter closes open position if any.");
-        }
-
-        private async System.Threading.Tasks.Task TradeLoopAsync(System.Threading.CancellationToken ct)
-        {
-            bool liveLike = _ex is Exchange.BinanceHttpExchange;
-
-            while (!ct.IsCancellationRequested)
-            {
-                try
-                {
-                    if (_nextCheckUtc is DateTime next && DateTime.UtcNow < next)
-                    {
-                        UpdateNextLabel();
-                        await System.Threading.Tasks.Task.Delay(1000, ct);
-                        continue;
-                    }
-
-                    AppendLog("Loop tick: refresh tickers/equity…");
-                    await RefreshTickersAsync();
-                    await RefreshEquityAsync();
-                    await RefreshAccountSummaryAsync();
-
-                    AppendLog("Loop tick: deciding…");
-                    var decision = await _engine.DecideAsync(ct);
-                    var sym = string.IsNullOrWhiteSpace(decision.symbol) ? "-" : decision.symbol;
-                    var ret = decision.ret3h.HasValue ? decision.ret3h.Value.ToString("P2") : "";
-                    AppendLog($"Decision: {decision.kind} {sym} {ret}");
-
-                    if (decision.kind != DecisionKind.CandidateFound || string.IsNullOrWhiteSpace(decision.symbol))
-                    {
-                        _nextCheckUtc = decision.nextCheckUtc;
-                        _header.State.Text = $"State: {decision.note}";
-                        AppendLog(decision.note);
-                        UpdateNextLabel();
-                        await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(3), ct);
-                        continue;
-                    }
-
-                    var (entered, symbol, note) = await _trader.TryEnterAsync(ct);
-
-                    if (!entered)
-                    {
-                        _header.State.Text = $"State: No entry — {note}";
-                        AppendLog(_header.State.Text);
-                        _nextCheckUtc ??= decision.nextCheckUtc;
-                        UpdateNextLabel();
-                        await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(3), ct);
-                        continue;
-                    }
-
-                    _header.State.Text = $"State: Entered — {note}";
-                    AppendLog(_header.State.Text);
-
-                    var entryMid = ExtractEntryPrice(note);
-                    var qty = ExtractQty(note);
-
-                    if (!liveLike)
-                    {
-                        var outcome = await _trader.WaitAndSettleAsync(symbol!, DateTime.UtcNow, entryMid, qty, ct);
-                        if (outcome is not null)
-                        {
-                            AppendLog($"Exit {outcome.Symbol} — {outcome.Reason} @ {outcome.ExitPrice:0.########} | PnL {outcome.PnL:0.00}");
-                            _header.State.Text = $"Exit: {outcome.Symbol} {outcome.Reason} | PnL {outcome.PnL:0.00}";
-                            await RefreshEquityAsync();
-                            await RefreshAccountSummaryAsync();
-                        }
-                    }
-                    else
-                    {
-                        AppendLog("Live/demo: OCO managing exit; pausing before next scan…");
-                        await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(20), ct);
-                    }
-
-                    _nextCheckUtc = null;
-                    _header.Next.Text = "Next check: asap";
-                    await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(2), ct);
-                }
-                catch (System.Threading.Tasks.TaskCanceledException) { }
-                catch (Exception ex)
-                {
-                    AppendLog("Loop error: " + ex.Message);
-                    await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(3), ct);
-                }
-            }
-        }
-
-        // ========================= UTIL =========================
-
-        private void UpdateNextLabel()
-        {
-            if (_nextCheckUtc is null) { _header.Next.Text = "Next check: asap"; return; }
-            var rem = _nextCheckUtc.Value - DateTime.UtcNow;
-            if (rem < TimeSpan.Zero) rem = TimeSpan.Zero;
-            _header.Next.Text = $"Next check in: {rem:hh\\:mm\\:ss} (UTC {_nextCheckUtc:HH:mm:ss})";
-        }
-
-        private static string PrettyJson(string json)
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(json);
-                return JsonSerializer.Serialize(doc.RootElement, new JsonSerializerOptions { WriteIndented = true });
-            }
-            catch { return json; }
-        }
-
-        private static decimal ExtractEntryPrice(string note)
-        {
-            var atIdx = note.IndexOf('@');
-            if (atIdx < 0) return 0m;
-            var comma = note.IndexOf(',', atIdx + 1);
-            var span = note[(atIdx + 1)..(comma > atIdx ? comma : note.Length)].Trim();
-            return decimal.TryParse(span, out var d) ? d : 0m;
-        }
-
-        private static decimal ExtractQty(string note)
-        {
-            const string k = "qty";
-            var i = note.IndexOf(k, StringComparison.OrdinalIgnoreCase);
-            if (i < 0) return 0m;
-            var tail = note[(i + k.Length)..];
-            var end = tail.IndexOf(',');
-            var s = (end >= 0 ? tail[..end] : tail).Trim();
-            return decimal.TryParse(s, out var d) ? d : 0m;
         }
     }
 }

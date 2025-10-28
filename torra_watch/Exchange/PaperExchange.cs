@@ -1,7 +1,7 @@
 ﻿using torra_watch.Core;
 
 namespace torra_watch.Exchange;
-public sealed class PaperExchange : IExchange
+public class PaperExchange 
 {
     private readonly Dictionary<string, decimal> _lastPrices = new();
     private readonly Dictionary<string, decimal> _price3hAgo = new();
