@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace torra_watch.Models
 {
-    internal class Balance
+    public class Balance
     {
         public string Asset { get; init; } = "";
         public decimal Qty { get; init; }

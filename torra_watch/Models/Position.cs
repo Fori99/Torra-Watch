@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace torra_watch.Models
 {
-    internal class Position
+    public class Position
     {
         public string Symbol { get; init; } = "";
         public decimal Price { get; init; }

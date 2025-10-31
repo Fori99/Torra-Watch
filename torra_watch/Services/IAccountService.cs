@@ -9,9 +9,10 @@ using torra_watch.Models;
 
 namespace torra_watch.Services
 {
-    internal interface IAccountService
+    public interface IAccountService
     {
         Task<AccountSnapshot> GetBalancesAsync(CancellationToken ct);
-        Task<IReadOnlyList<Models.Position>> GetOpenOrdersAsync(CancellationToken ct);
+        Task<IReadOnlyList<OpenOrder>> GetOpenOrdersAsync(CancellationToken ct);
     }
+
 }

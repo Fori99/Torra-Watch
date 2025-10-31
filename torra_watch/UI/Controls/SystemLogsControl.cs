@@ -1,29 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Windows.Forms;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Windows.Forms;
+using System.Drawing;
+using torra_watch.UI.ViewModels;
 
 namespace torra_watch.UI.Controls
 {
-    public enum LogLevel { Debug, Info, Success, Warning, Error }
-
-    public sealed class LogEntryVM
-    {
-        public DateTime TimeUtc { get; init; } = DateTime.UtcNow;
-        public LogLevel Level { get; init; } = LogLevel.Info;
-        public string Message { get; init; } = "";
-    }
-
     public partial class SystemLogsControl : UserControl
     {
-
-        // Theme tokens
+        // ---- Theme tokens
         private static readonly Color HeaderBg = Color.FromArgb(248, 249, 251);
         private static readonly Color HeaderText = Color.FromArgb(60, 66, 72);
         private static readonly Color GridLines = Color.FromArgb(234, 236, 239);
@@ -41,13 +28,24 @@ namespace torra_watch.UI.Controls
         private bool _autoScroll = true;
         private int _maxLines = 5000;
 
+        // add near other fields
+        private readonly ToolTip _tip = new();
+        private int _lastTipIndex = -1;
+        private const int MsgCol = 2;
+        private readonly Font _rowFont = new("Segoe UI", 9f);
+
+
+        // cached fonts
+        private readonly Font _fontHeader = new("Segoe UI Semibold", 9f);
+        private readonly Font _fontCell = new("Segoe UI", 9f);
+
         public SystemLogsControl()
         {
             Dock = DockStyle.Fill;
             BackColor = Color.Transparent;
             Padding = new Padding(8);
 
-            // ListView setup (virtual + owner draw for colors)
+            // --- ListView (virtual + owner draw)
             _lv.Dock = DockStyle.Fill;
             _lv.BorderStyle = BorderStyle.None;
             _lv.FullRowSelect = true;
@@ -57,28 +55,37 @@ namespace torra_watch.UI.Controls
             _lv.GridLines = false;
             _lv.OwnerDraw = true;
             _lv.VirtualMode = true;
+
             _lv.RetrieveVirtualItem += Lv_RetrieveVirtualItem;
             _lv.DrawColumnHeader += Lv_DrawColumnHeader;
             _lv.DrawSubItem += Lv_DrawSubItem;
             _lv.VirtualListSize = 0;
-            _lv.Scrolled += (_, __) => _autoScroll = IsAtBottom();
-
 
             _lv.Columns.Add("Time", 110);
-            _lv.Columns.Add("Level", 72);
-            _lv.Columns.Add("Message", 600);
+            _lv.Columns.Add("Level", 80);
+            _lv.Columns.Add("Message", 900);
+
+            _lv.Scrollable = true;
+            _lv.Columns[MsgCol].Width = 900;        // big default
+            _lv.MouseMove += Lv_MouseMove;
+            _lv.MouseLeave += (_, __) => { _tip.Hide(_lv); _lastTipIndex = -1; };
+            _lv.DoubleClick += Lv_DoubleClick;
+
 
             _lv.Resize += (_, __) => AutoSizeColumns();
+            _lv.Scrolled += (_, __) => _autoScroll = IsAtBottom();
 
-            // context menu
-            var miCopy = new ToolStripMenuItem("Copy selected", null, (_, __) => CopySelected());
+            // --- Context menu
+            var miCopy = new ToolStripMenuItem("Copy selected", null, CopySelected);
             var miClear = new ToolStripMenuItem("Clear", null, (_, __) => Clear());
             var miAuto = new ToolStripMenuItem("Auto-scroll") { Checked = _autoScroll };
-            miAuto.Click += (_, __) => { _autoScroll = !miAuto.Checked; miAuto.Checked = _autoScroll; };
+            miAuto.Click += (_, __) =>
+            {
+                _autoScroll = !_autoScroll;
+                miAuto.Checked = _autoScroll;
+            };
             _menu.Items.AddRange(new ToolStripItem[] { miCopy, miClear, new ToolStripSeparator(), miAuto });
             _lv.ContextMenuStrip = _menu;
-
-
 
             Controls.Add(_lv);
             ApplyHeaderStyle();
@@ -91,39 +98,51 @@ namespace torra_watch.UI.Controls
             set { _maxLines = Math.Max(100, value); TrimIfNeeded(); Redraw(); }
         }
 
-        public void Append(LogEntryVM item)
-        {
-            _items.Add(item);
-            TrimIfNeeded();
-            _lv.VirtualListSize = _items.Count;
-            if (_autoScroll) ScrollToBottom();
-        }
+        /// <summary>Convenience overload so callers can log plain text.</summary>
 
-        public void AppendRange(IEnumerable<LogEntryVM> items)
-        {
-            _items.AddRange(items);
-            TrimIfNeeded();
-            _lv.VirtualListSize = _items.Count;
-            if (_autoScroll) ScrollToBottom();
-        }
 
         public void Clear()
         {
+            if (InvokeRequired) { BeginInvoke(new Action(Clear)); return; }
+
             _items.Clear();
             _lv.VirtualListSize = 0;
             _lv.Invalidate();
         }
 
-        // ---------- Internals ----------
+        private void CopySelected(object? sender, EventArgs e)
+        {
+            if (_lv.SelectedIndices.Count == 0) return;
+
+            var sb = new StringBuilder();
+            foreach (int i in _lv.SelectedIndices)
+            {
+                var it = _items[i];
+                // If your LogEntryVM uses Timestamp (recommended), use it here:
+                sb.AppendLine($"{it.Timestamp:HH:mm:ss} {it.Level,-7} {it.Message}");
+                // If your VM property is TimeUtc, then:
+                // sb.AppendLine($"{it.TimeUtc:HH:mm:ss} {it.Level,-7} {it.Message}");
+            }
+            Clipboard.SetText(sb.ToString());
+        }
+
+
+        // ---------- ListView virtual/paint ----------
         private void Lv_RetrieveVirtualItem(object? sender, RetrieveVirtualItemEventArgs e)
         {
             var it = _items[e.ItemIndex];
+
+            // Prefer Timestamp; if you had an older VM with TimeUtc, show that too.
+            var when = it.Timestamp != default ? it.Timestamp
+                     : (it.GetType().GetProperty("TimeUtc")?.GetValue(it) as DateTime? ?? DateTime.UtcNow);
+
             e.Item = new ListViewItem(new[]
-            {
-                it.TimeUtc.ToLocalTime().ToString("HH:mm:ss"),
+             {
+                it.Timestamp.ToLocalTime().ToString("HH:mm:ss"),
                 it.Level.ToString(),
-                it.Message
+                it.Message ?? "(empty)"  // Add null coalescing
             });
+
         }
 
         private void Lv_DrawColumnHeader(object? sender, DrawListViewColumnHeaderEventArgs e)
@@ -131,11 +150,16 @@ namespace torra_watch.UI.Controls
             using var bg = new SolidBrush(HeaderBg);
             using var pen = new Pen(GridLines);
             using var textBrush = new SolidBrush(HeaderText);
+
             e.Graphics.FillRectangle(bg, e.Bounds);
             e.Graphics.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
-            TextRenderer.DrawText(e.Graphics, e.Header.Text, new Font("Segoe UI Semibold", 9f),
-                new Rectangle(e.Bounds.X + 8, e.Bounds.Y + 8, e.Bounds.Width - 16, e.Bounds.Height - 16),
-                HeaderText, TextFormatFlags.EndEllipsis);
+
+            TextRenderer.DrawText(e.Graphics,
+                e.Header.Text,
+                _fontHeader,
+                new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width - 16, e.Bounds.Height),
+                HeaderText,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
 
         private void Lv_DrawSubItem(object? sender, DrawListViewSubItemEventArgs e)
@@ -151,19 +175,29 @@ namespace torra_watch.UI.Controls
                 _ => RowText
             };
 
-            // row background
             using var bg = new SolidBrush(Color.White);
             e.Graphics.FillRectangle(bg, e.Bounds);
 
-            // text
-            var text = e.SubItem.Text;
-            var rect = new Rectangle(e.Bounds.X + 8, e.Bounds.Y + 6, e.Bounds.Width - 12, e.Bounds.Height - 8);
-            var font = e.ColumnIndex == 2
-                ? new Font("Segoe UI", 9f)
-                : new Font("Segoe UI", 9f);
-            TextRenderer.DrawText(e.Graphics, text, font, rect, color, TextFormatFlags.EndEllipsis);
+            // Use full bounds height for proper vertical alignment
+            var rect = new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height);
+
+            var flags = TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter;
+            if (e.ColumnIndex != MsgCol)
+                flags |= TextFormatFlags.EndEllipsis;
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                e.SubItem.Text,
+                _rowFont,
+                rect,
+                color,
+                flags
+            );
         }
 
+
+
+        // ---------- Helpers ----------
         private void ApplyHeaderStyle()
         {
             _lv.BackColor = Color.White;
@@ -173,11 +207,54 @@ namespace torra_watch.UI.Controls
         private void AutoSizeColumns()
         {
             if (_lv.Columns.Count < 3) return;
-            var w = _lv.ClientSize.Width;
-            _lv.Columns[0].Width = 110;     // Time
-            _lv.Columns[1].Width = 80;      // Level
-            _lv.Columns[2].Width = Math.Max(100, w - _lv.Columns[0].Width - _lv.Columns[1].Width - 8);
+            _lv.Columns[0].Width = 110;   // Time
+            _lv.Columns[1].Width = 80;    // Level
+
+            // Only raise minimum; never force a smaller width for the message column.
+            var minMsg = Math.Max(100, _lv.ClientSize.Width - _lv.Columns[0].Width - _lv.Columns[1].Width - 8);
+            if (_lv.Columns[MsgCol].Width < minMsg)
+                _lv.Columns[MsgCol].Width = minMsg;
         }
+
+
+        private void Lv_MouseMove(object? sender, MouseEventArgs e)
+        {
+            var hit = _lv.HitTest(e.Location);
+            if (hit.Item == null) { _tip.Hide(_lv); _lastTipIndex = -1; return; }
+
+            int index = hit.Item.Index;
+            if (index == _lastTipIndex) return;
+
+            _lastTipIndex = index;
+            var it = _items[index];
+            _tip.Show(it.Message ?? string.Empty, _lv, e.Location + new Size(16, 16), 5000);
+        }
+
+        private void Lv_DoubleClick(object? sender, EventArgs e)
+        {
+            if (_lv.SelectedIndices.Count == 0) return;
+            int i = _lv.SelectedIndices[0];
+            var it = _items[i];
+            using var dlg = new Form
+            {
+                Text = $"{it.Timestamp:HH:mm:ss}  {it.Level}",
+                StartPosition = FormStartPosition.CenterParent,
+                Size = new Size(720, 360)
+            };
+            var tb = new TextBox
+            {
+                Multiline = true,
+                ReadOnly = true,
+                Dock = DockStyle.Fill,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Font = new Font("Consolas", 10f),
+                Text = it.Message ?? string.Empty
+            };
+            dlg.Controls.Add(tb);
+            dlg.ShowDialog(this);
+        }
+
 
         private void TrimIfNeeded()
         {
@@ -191,10 +268,12 @@ namespace torra_watch.UI.Controls
             _lv.EnsureVisible(_items.Count - 1);
         }
 
-        // add near the class:
-        const int LVM_GETCOUNTPERPAGE = 0x1000 + 40;
+        private void Redraw() => _lv.Invalidate();
+
+        // ---- “At bottom” detection (virtual list)
+        private const int LVM_GETCOUNTPERPAGE = 0x1000 + 40;
         [DllImport("user32.dll")]
-        static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
         private bool IsAtBottom()
         {
@@ -207,30 +286,52 @@ namespace torra_watch.UI.Controls
             return top + perPage >= _items.Count - 1;
         }
 
-        private void CopySelected()
+        private void EnsureMsgWidth(string msg)
         {
-            if (_lv.SelectedIndices.Count == 0) return;
-            var sb = new System.Text.StringBuilder();
-            foreach (int i in _lv.SelectedIndices)
-            {
-                var it = _items[i];
-                sb.AppendLine($"{it.TimeUtc:HH:mm:ss} {it.Level,-7} {it.Message}");
-            }
-            Clipboard.SetText(sb.ToString());
+            if (_lv.Columns.Count <= MsgCol) return;
+            var sz = TextRenderer.MeasureText(msg ?? string.Empty, _rowFont);
+            var need = sz.Width + 40;                     // some padding
+            if (need > _lv.Columns[MsgCol].Width)
+                _lv.Columns[MsgCol].Width = need;         // enables horizontal scrollbar automatically
         }
 
-        private void Redraw() => _lv.Invalidate();
+        public void Append(LogEntryVM item)
+        {
+            _items.Add(item);
+            TrimIfNeeded();
+            _lv.VirtualListSize = _items.Count;
+            EnsureMsgWidth(item.Message);
+            if (_autoScroll) ScrollToBottom();
+        }
+        public void Append(string message, LogLevel level = LogLevel.Info)
+        {
+            Append(new LogEntryVM
+            {
+                Timestamp = DateTime.Now,
+                Level = level,
+                Message = message ?? string.Empty
+            });
+        }
+
+        public void AppendRange(IEnumerable<LogEntryVM> items)
+        {
+            foreach (var it in items) EnsureMsgWidth(it.Message);
+            _items.AddRange(items);
+            TrimIfNeeded();
+            _lv.VirtualListSize = _items.Count;
+            if (_autoScroll) ScrollToBottom();
+        }
 
 
     }
 
+    // --- ListView extension with Scroll event
     sealed class ListViewEx : ListView
     {
         public event EventHandler? Scrolled;
 
-        // Win32 messages
-        const int WM_VSCROLL = 0x0115;
-        const int WM_MOUSEWHEEL = 0x020A;
+        private const int WM_VSCROLL = 0x0115;
+        private const int WM_MOUSEWHEEL = 0x020A;
 
         protected override void WndProc(ref Message m)
         {

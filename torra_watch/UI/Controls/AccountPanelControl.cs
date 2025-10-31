@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using torra_watch.Models;
 using torra_watch.UI.ViewModels;
 
 namespace torra_watch.UI.Controls
@@ -20,6 +21,65 @@ namespace torra_watch.UI.Controls
 
         private readonly BindingSource _bs = new();          // AccountVM
         private readonly BindingSource _bsHoldings = new();  // List<HoldingVM>
+
+        // Optional backing fields if you want to reuse data later
+        private decimal _totalUsdt;
+        private List<Balance> _balances = new();
+        private List<Position> _positions = new();
+
+        // TODO: point these to your real UI elements
+        // If you already have labels/grids with other names, change them here.
+        private Label? _lblTotalUsdt;        // e.g., the big "85,230.00 USDT" label
+        private DataGridView? _gridBalances; // table for balances
+        private DataGridView? _gridOrders;   // table for open orders/positions
+
+        /// <summary>Update the big total balance number.</summary>
+        public void SetTotalUsdt(decimal totalUsdt)
+        {
+            _totalUsdt = totalUsdt;
+            // if you have a label in the designer named lblTotalUsdt, assign it to _lblTotalUsdt in ctor.
+            if (_lblTotalUsdt != null)
+                _lblTotalUsdt.Text = $"{totalUsdt:N2} USDT";
+            // otherwise do nothing; you can wire it later.
+        }
+
+        /// <summary>Replace the balances table.</summary>
+        public void SetBalances(IEnumerable<Balance> balances)
+        {
+            _balances = balances?.ToList() ?? new List<Balance>();
+            if (_gridBalances != null)
+            {
+                // Simple bind; you can style the grid elsewhere
+                _gridBalances.AutoGenerateColumns = true;
+                _gridBalances.DataSource = _balances
+                    .Select(b => new
+                    {
+                        Asset = b.Asset,
+                        Qty = b.Qty,
+                        EstUSDT = Math.Round(b.EstUsdt, 2)
+                    })
+                    .ToList();
+            }
+        }
+
+        /// <summary>Replace the open orders/positions table.</summary>
+        public void SetOpenOrders(IEnumerable<Position> positions)
+        {
+            _positions = positions?.ToList() ?? new List<Position>();
+            if (_gridOrders != null)
+            {
+                _gridOrders.AutoGenerateColumns = true;
+                _gridOrders.DataSource = _positions
+                    .Select(p => new
+                    {
+                        Symbol = p.Symbol,
+                        Entry = p.Price,
+                        TP = p.TakeProfit,
+                        SL = p.StopLoss
+                    })
+                    .ToList();
+            }
+        }
 
         public AccountPanelControl()
         {

@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace torra_watch.Models
 {
-    internal class AccountSnapshot
+    public class AccountSnapshot
     {
         public decimal TotalUsdt { get; init; }
         public IReadOnlyList<Balance> Balances { get; init; } = Array.Empty<Balance>();

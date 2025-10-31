@@ -41,6 +41,7 @@ internal static class Program
             //try { Log.Error($"UNHANDLED: {msg}"); } catch { /* ignore */ }
         };
 
+
         using var host = Host.CreateDefaultBuilder()
             .ConfigureServices(services =>
             {
