@@ -1,13 +1,8 @@
-﻿using System;
-using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Windows.Forms;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.VisualBasic.Logging;
+using System.Net;
+using System.Net.Http.Headers;
 using torra_watch.Core;
-using torra_watch.Exchange;
 
 namespace torra_watch;
 

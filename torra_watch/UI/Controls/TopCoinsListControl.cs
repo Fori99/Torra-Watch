@@ -1,14 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Windows.Forms;
-using torra_watch.UI.ViewModels;
-using System.Globalization;
+﻿using torra_watch.UI.ViewModels;
 
 namespace torra_watch.UI.Controls
 {
@@ -68,9 +58,20 @@ namespace torra_watch.UI.Controls
             AdjustRowWidths();                                     // <— add this
         }
 
-        private static string Money(decimal v) =>
-    v >= 1m ? v.ToString("C0", CultureInfo.GetCultureInfo("en-US"))
-            : v.ToString("C", CultureInfo.GetCultureInfo("en-US")); // keeps cents for sub-$1
+        private string Money(decimal value)
+        {
+            // Smart formatting based on price magnitude
+            if (value < 0.01m)
+                return $"${value:N6}";      // $0.000123
+            else if (value < 1m)
+                return $"${value:N4}";      // $0.1234
+            else if (value < 100m)
+                return $"${value:N2}";      // $31.26
+            else if (value < 10000m)
+                return $"${value:N2}";      // $1,234.56
+            else
+                return $"${value:N0}";      // $42,150
+        }
 
 
 

@@ -1,10 +1,5 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Text.Json;
-using System.Threading.Tasks;
 
 namespace torra_watch.Core
 {
@@ -18,6 +13,7 @@ namespace torra_watch.Core
         public string QuoteAsset { get; set; } = "USDT";
         public string[] Blacklist { get; set; } = Array.Empty<string>();
 
+        public int CooldownMinutes { get; set; } = 5;
         // --- Universe / filters
         public int TopN { get; set; } = 150;
         public decimal MinVol24h { get; set; } = 2_000_000m;

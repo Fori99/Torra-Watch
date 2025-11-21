@@ -1,13 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Windows.Forms;
-using torra_watch.UI.ViewModels;
+﻿using torra_watch.UI.ViewModels;
 
 namespace torra_watch.UI.Controls
 {
@@ -36,7 +27,8 @@ namespace torra_watch.UI.Controls
             // dot
             _dot.Width = _dot.Height = 14;
             _dot.Margin = new Padding(6, 10, 4, 0);
-            _dot.Paint += (s, e) => {
+            _dot.Paint += (s, e) =>
+            {
                 e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 using var b = new SolidBrush(_dot.BackColor);
                 e.Graphics.FillEllipse(b, 0, 0, _dot.Width - 1, _dot.Height - 1);

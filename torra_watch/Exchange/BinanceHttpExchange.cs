@@ -1,5 +1,4 @@
 ﻿using System.Globalization;
-using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -28,7 +27,7 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
     private long _serverTimeOffsetMs = 0;
     private const int RecvWindowMs = 5000;
 
-     //----------------- ctor -----------------
+    //----------------- ctor -----------------
     public BinanceHttpExchange(ExchangeConfig cfg, HttpClient http)
     {
         _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
@@ -38,8 +37,8 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
 
         if (_cfg.UseDemo)
         {
-            _publicBaseUrl = "https://demo-api.binance.com";
-            _privateBaseUrl = "https://demo-api.binance.com";
+            _publicBaseUrl = "https://api.binance.com";
+            _privateBaseUrl = "https://api.binance.com";
         }
         else if (_cfg.UseTestnet)
         {
@@ -55,7 +54,7 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
 
     public void Dispose() { /* HttpClient is owned by DI */ }
 
-     //----------------- UI snapshot helpers -----------------
+    //----------------- UI snapshot helpers -----------------
     public string PublicBaseUrl => _publicBaseUrl;
     public string PrivateBaseUrl => _privateBaseUrl;
     public string Quote => _quote;
@@ -93,7 +92,7 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
         return (env, pubHost, privHost, KeysLoaded, list);
     }
 
-     //----------------- Market data(public) -----------------
+    //----------------- Market data(public) -----------------
     private async Task<HashSet<string>?> TryGetTradablesAsync(CancellationToken ct)
     {
         if (_tradablesCache is not null && DateTime.UtcNow - _tradablesTs < _tradablesTtl)
@@ -211,7 +210,7 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
         return (ParseDec(el.TryGetProperty("bidPrice", out var b) ? b.GetString() : null),
                 ParseDec(el.TryGetProperty("askPrice", out var a) ? a.GetString() : null));
     }
-     //----------------- Account & trading(signed) -----------------
+    //----------------- Account & trading(signed) -----------------
 
     public async Task<decimal> GetEquityAsync(CancellationToken ct = default)
     {
@@ -326,12 +325,12 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
     {
         if (_cfg.ReadOnly) return;
 
-       // 1) cancel all open orders for this symbol
+        // 1) cancel all open orders for this symbol
 
-       await SendSignedAsync<JsonElement>(HttpMethod.Delete, "/api/v3/openOrders", new() { ["symbol"] = symbol }, ct);
+        await SendSignedAsync<JsonElement>(HttpMethod.Delete, "/api/v3/openOrders", new() { ["symbol"] = symbol }, ct);
 
-       // 2) sell any available base asset
-       var baseAsset = symbol.EndsWith(_quote, StringComparison.OrdinalIgnoreCase) ? symbol[..^_quote.Length] : symbol;
+        // 2) sell any available base asset
+        var baseAsset = symbol.EndsWith(_quote, StringComparison.OrdinalIgnoreCase) ? symbol[..^_quote.Length] : symbol;
 
         var acc = await SendSignedAsync<JsonElement>(HttpMethod.Get, "/api/v3/account", null, ct);
         if (!acc.TryGetProperty("balances", out var bals) || bals.ValueKind != JsonValueKind.Array) return;
@@ -365,7 +364,7 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
         }
     }
 
-   // Rich method for internal use
+    // Rich method for internal use
     public sealed record SymbolRules(decimal StepSize, decimal MinQty, decimal TickSize, decimal MinNotional);
 
     public async Task<SymbolRules> GetSymbolRulesDetailedAsync(string symbol, CancellationToken ct = default)
@@ -405,7 +404,7 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
         return new SymbolRules(step, minQty, tick, minNotional);
     }
 
-   // Explicit interface shape(for IExchange)
+    // Explicit interface shape(for IExchange)
     public async Task<(decimal stepSize, decimal minNotional)> GetSymbolRulesAsync(
         string symbol, CancellationToken ct = default)
     {
@@ -581,7 +580,7 @@ public sealed class BinanceHttpExchange //: IExchange, IDisposable
         return set;
     }
 
-     //----------------- Debug/aux for UI -----------------
+    //----------------- Debug/aux for UI -----------------
     public Task<string> DebugAccountRawAsync(CancellationToken ct = default)
         => SendSignedRawAsync(HttpMethod.Get, "/api/v3/account", null, ct);
 

@@ -1,12 +1,7 @@
-﻿using System;
-using System.Drawing;
-using System.Linq;
-using System.Net.Http;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Windows.Forms;
+﻿using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using torra_watch.Core;
-using torra_watch.Models;            // Position, Balance, OpenOrder
 using torra_watch.Services;
 using torra_watch.UI.Controls;
 using torra_watch.UI.ViewModels;
@@ -34,9 +29,10 @@ namespace torra_watch
         private PriceChartControl _priceChart = null!;
         private AccountPanelControl _accountPanel = null!;
 
-        // timers
+        // timers - ⭐ ADDED TRADE TIMER
         private System.Windows.Forms.Timer? _scanTimer;
         private System.Windows.Forms.Timer? _accountTimer;
+        private System.Windows.Forms.Timer? _tradeTimer;  // ⭐ NEW
 
         // ---------------- UI style tokens ----------------
         private static class Ui
@@ -68,7 +64,7 @@ namespace torra_watch
             if (BinanceCreds.TryRead(out var key, out var secret, out var mode, _systemLogs))
             {
                 var httpSigned = new HttpClient();
-                var signed = new BinanceSignedClient(httpSigned, key, secret, mode, _systemLogs); // Pass logger
+                var signed = new BinanceSignedClient(httpSigned, key, secret, mode, _systemLogs);
                 _account = new BinanceAccountService(signed, httpPublic);
             }
 
@@ -94,55 +90,15 @@ namespace torra_watch
             };
 
             // Control panel events
-            _controlPanel.StartRequested += async (_, __) =>  TestBinanceConnection();
+            _controlPanel.StartRequested += async (_, __) => await StartAllAsync();
             _controlPanel.StopRequested += (_, __) => StopAll();
-            _controlPanel.PanicRequested += (_, __) => MessageBox.Show("PANIC!");
-
-            // Top coins → chart
-            //_topCoins.SymbolSelected += symbol => LoadChart(symbol);
+            _controlPanel.PanicRequested += (_, __) => DiagnoseAccountMismatch();
 
             // Initial status (stopped)
             UpdateStatus(running: false);
         }
 
-        // Add this test method to MainForm
-        private async void TestBinanceConnection()
-        {
-            try
-            {
-                _systemLogs?.Append("Testing Binance API connection...", LogLevel.Info);
-
-                var key = Environment.GetEnvironmentVariable("TORRA_BINANCE_KEY") ?? "";
-                var secret = Environment.GetEnvironmentVariable("TORRA_BINANCE_SECRET") ?? "";
-
-                using var http = new HttpClient();
-                http.BaseAddress = new Uri("https://testnet.binance.vision");
-                http.DefaultRequestHeaders.Add("X-MBX-APIKEY", key);
-
-                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                var queryString = $"timestamp={timestamp}";
-
-                using var hmac = new System.Security.Cryptography.HMACSHA256(System.Text.Encoding.UTF8.GetBytes(secret));
-                var hash = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(queryString));
-                var signature = BitConverter.ToString(hash).Replace("-", "").ToLower();
-
-                var url = $"/api/v3/account?{queryString}&signature={signature}";
-
-                _systemLogs?.Append($"Testing URL: {url}", LogLevel.Debug);
-
-                var response = await http.GetAsync(url);
-                var body = await response.Content.ReadAsStringAsync();
-
-                _systemLogs?.Append($"Status: {response.StatusCode}", LogLevel.Info);
-                _systemLogs?.Append($"Response: {body}", LogLevel.Info);
-            }
-            catch (Exception ex)
-            {
-                _systemLogs?.Append($"Test failed: {ex.Message}", LogLevel.Error);
-            }
-        }
-
-        // ---------------- Layout ----------------
+        // ---------------- Layout (unchanged) ----------------
         private void BuildDashboardShell()
         {
             Text = "TorraWatch";
@@ -163,18 +119,15 @@ namespace torra_watch
             grid.RowStyles.Add(new RowStyle(SizeType.Percent, 35));
             Controls.Add(grid);
 
-            // LEFT: Top Coins (spans all rows)
             var topCoinsCard = BuildTopCoinsSection();
             grid.Controls.Add(topCoinsCard, 0, 0);
             grid.SetRowSpan(topCoinsCard, 3);
 
-            // ROW 0: Control Panel, Settings, Status
             var (controlPanelCard, settingsCard, statusCard) = BuildRow0_ControlsSettingsStatus();
             grid.Controls.Add(controlPanelCard, 1, 0);
             grid.Controls.Add(settingsCard, 2, 0);
             grid.Controls.Add(statusCard, 3, 0);
 
-            // ROW 1: Logs + Account
             var logsCard = MakeCard("System Logs", "");
             _systemLogs = new SystemLogsControl { Dock = DockStyle.Fill };
             ReplaceCardBody(logsCard, _systemLogs);
@@ -186,7 +139,6 @@ namespace torra_watch
             ReplaceCardBody(accountCard, _accountPanel);
             grid.Controls.Add(accountCard, 3, 1);
 
-            // ROW 2: Trading Overview (orders + chart)
             var overviewCard = BuildRow2_TradingOverview();
             grid.Controls.Add(overviewCard, 1, 2);
             grid.SetColumnSpan(overviewCard, 3);
@@ -194,17 +146,14 @@ namespace torra_watch
 
         private (CardFrameControl, CardFrameControl, CardFrameControl) BuildRow0_ControlsSettingsStatus()
         {
-            // Control Panel
             var controlPanelCard = MakeCard("Control Panel", "");
             _controlPanel = new ControlPanelControl { Dock = DockStyle.Fill };
             ReplaceCardBody(controlPanelCard, _controlPanel);
 
-            // Settings
             var settingsCard = MakeCard("Settings", "");
             _settingsPanel = new SettingsPanelControl { Dock = DockStyle.Fill };
             ReplaceCardBody(settingsCard, _settingsPanel);
 
-            // Status
             var statusCard = MakeCard("Status", "");
             _statusCard = new StatusCardControl { Dock = DockStyle.Fill };
             ReplaceCardBody(statusCard, _statusCard);
@@ -223,7 +172,6 @@ namespace torra_watch
 
             var lookbackH = Math.Max(1, _settings.LookbackMinutes / 60);
             _topCoins.SetWindowHours(lookbackH);
-            _topCoins.SetCoins(SeedDemoTopCoins(), lookbackH);
 
             ReplaceCardBody(topCoinsCard, _topCoins);
             return topCoinsCard;
@@ -253,7 +201,6 @@ namespace torra_watch
             overview.Body.Controls.Clear();
             overview.Body.Controls.Add(inner);
 
-            // LEFT: Live Orders
             var ordersCard = MakeHeaderlessCard("Live Orders", out var ordersHeaderLabel);
             var liveOrders = new LiveOrdersListControl { Dock = DockStyle.Fill, ShowHeader = false };
             liveOrders.Demo();
@@ -261,7 +208,6 @@ namespace torra_watch
             ordersCard.Body.Controls.Add(ordersHeaderLabel);
             inner.Controls.Add(ordersCard, 0, 0);
 
-            // MIDDLE+RIGHT: Chart
             var chartCard = MakeHeaderlessCard("Price Chart", out var chartHeaderLabel, margin: new Padding(8, 0, 0, 0));
             _priceChart = new PriceChartControl { Dock = DockStyle.Fill };
             chartCard.Body.Controls.Add(_priceChart);
@@ -272,7 +218,6 @@ namespace torra_watch
             return overview;
         }
 
-        // ---------------- Helpers ----------------
         private static CardFrameControl MakeCard(string title, string placeholder)
         {
             var card = new CardFrameControl { Dock = DockStyle.Fill, Title = title, Margin = Ui.CardMargin };
@@ -314,51 +259,71 @@ namespace torra_watch
             card.Body.Controls.Add(content);
         }
 
-        private static TopCoinVM[] SeedDemoTopCoins() => new[]
-        {
-            new TopCoinVM { Symbol = "BTC",  Price = 42150m, ChangePct =  2.5m },
-            new TopCoinVM { Symbol = "ETH",  Price =  2250m, ChangePct =  1.8m },
-            new TopCoinVM { Symbol = "BNB",  Price =   312m, ChangePct = -0.5m },
-            new TopCoinVM { Symbol = "SOL",  Price =    98m, ChangePct =  5.2m },
-            new TopCoinVM { Symbol = "XRP",  Price =   0.6m, ChangePct =  0.7m },
-            new TopCoinVM { Symbol = "ADA",  Price =  0.52m, ChangePct =  0.8m },
-            new TopCoinVM { Symbol = "DOGE", Price =  0.12m, ChangePct =  1.1m },
-            new TopCoinVM { Symbol = "LTC",  Price =     78m, ChangePct =  0.4m },
-            new TopCoinVM { Symbol = "DOT",  Price =    6.2m, ChangePct =  1.6m },
-            new TopCoinVM { Symbol = "AVAX", Price =     25m, ChangePct = -0.9m },
-        };
-
-        // ---------------- Start/Stop orchestration ----------------
+        // ---------------- Start/Stop orchestration - ⭐ UPDATED ----------------
         private async Task StartAllAsync()
         {
             try
             {
+                _systemLogs?.Append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
+                _systemLogs?.Append("🚀 Starting Automated Trading Bot", LogLevel.Info);
+                _systemLogs?.Append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
+
                 await RefreshTopCoins();
 
                 if (_account != null)
                 {
                     await RefreshAccount();
+
+                    // Check if we already have open positions
+                    var openOrders = await _account.GetOpenOrdersAsync(_cts.Token);
+
+                    if (openOrders.Count == 0)
+                    {
+                        _systemLogs?.Append("💼 No open positions - executing initial trade", LogLevel.Info);
+                        await ExecuteTradeAsync();
+                    }
+                    else
+                    {
+                        _systemLogs?.Append($"⏸️ Skipping initial trade - {openOrders.Count} open order(s) exist", LogLevel.Warning);
+                        foreach (var order in openOrders.Take(3))
+                        {
+                            _systemLogs?.Append($"   → {order.Symbol}: {order.Type} {order.Side}", LogLevel.Info);
+                        }
+                    }
+
                     StartAccountTimer();
+                    StartTradeTimer();  // ⭐ START TRADE TIMER
                 }
                 else
                 {
-                    _systemLogs?.Append("Binance API keys not found. Running without account sync.");
+                    _systemLogs?.Append("❌ Binance API keys not found. Running without account sync.", LogLevel.Warning);
                 }
 
                 StartScanTimer();
                 UpdateStatus(running: true);
+
+                _systemLogs?.Append($"", LogLevel.Info);
+                _systemLogs?.Append($"✅ Bot started successfully!", LogLevel.Success);
             }
             catch (Exception ex)
             {
-                _systemLogs?.Append($"❌ Start: {ex.Message}");
+                _systemLogs?.Append($"❌ Start: {ex.Message}", LogLevel.Error);
             }
         }
 
         private void StopAll()
         {
+            _systemLogs?.Append("", LogLevel.Info);
+            _systemLogs?.Append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Warning);
+            _systemLogs?.Append("⏹️ Stopping Bot...", LogLevel.Warning);
+            _systemLogs?.Append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Warning);
+
             StopScanTimer();
             StopAccountTimer();
+            StopTradeTimer();  // ⭐ STOP TRADE TIMER
             UpdateStatus(running: false);
+
+            _systemLogs?.Append("✅ Bot stopped", LogLevel.Success);
         }
 
         private void UpdateStatus(bool running)
@@ -378,7 +343,7 @@ namespace torra_watch
             });
         }
 
-        // ---------------- Timers ----------------
+        // ---------------- Timers - ⭐ ADDED TRADE TIMER ----------------
         private void StartScanTimer()
         {
             _scanTimer ??= new System.Windows.Forms.Timer { Interval = 60_000 };
@@ -399,6 +364,82 @@ namespace torra_watch
         private void StopAccountTimer() => _accountTimer?.Stop();
         private async void AccountTick(object? s, EventArgs e) => await RefreshAccount();
 
+        // ⭐ NEW: Trade timer for automated loop
+        private void StartTradeTimer()
+        {
+            var cooldownMs = _settings.CooldownMinutes * 60_000;
+
+            _tradeTimer ??= new System.Windows.Forms.Timer { Interval = cooldownMs };
+            _tradeTimer.Tick -= TradeTick;
+            _tradeTimer.Tick += TradeTick;
+            _tradeTimer.Start();
+
+            _systemLogs?.Append($"", LogLevel.Info);
+            _systemLogs?.Append($"⏱️ Trade timer started", LogLevel.Success);
+            _systemLogs?.Append($"   Interval: {_settings.CooldownMinutes} minutes", LogLevel.Info);
+            _systemLogs?.Append($"   Next check: {DateTime.Now.AddMinutes(_settings.CooldownMinutes):HH:mm:ss}", LogLevel.Info);
+        }
+
+        private void StopTradeTimer()
+        {
+            _tradeTimer?.Stop();
+            _systemLogs?.Append("⏱️ Trade timer stopped", LogLevel.Info);
+        }
+
+        // ⭐ NEW: Trade tick - checks for closed positions and executes new trades
+        private async void TradeTick(object? s, EventArgs e)
+        {
+            try
+            {
+                _systemLogs?.Append($"", LogLevel.Info);
+                _systemLogs?.Append($"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
+                _systemLogs?.Append($"⏰ Trade Timer: {DateTime.Now:HH:mm:ss}", LogLevel.Info);
+                _systemLogs?.Append($"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
+
+                if (_account == null)
+                {
+                    _systemLogs?.Append("❌ No account connection", LogLevel.Error);
+                    return;
+                }
+
+                // Check for open positions
+                _systemLogs?.Append($"🔍 Checking for open positions...", LogLevel.Info);
+                var openOrders = await _account.GetOpenOrdersAsync(_cts.Token);
+
+                if (openOrders.Count > 0)
+                {
+                    _systemLogs?.Append($"⏸️ {openOrders.Count} position(s) still open - waiting", LogLevel.Warning);
+
+                    foreach (var order in openOrders.Take(3))
+                    {
+                        _systemLogs?.Append($"   → {order.Symbol}: {order.Type} {order.Side} @ ${order.Price}", LogLevel.Info);
+                    }
+
+                    _systemLogs?.Append($"   Next check: {DateTime.Now.AddMinutes(_settings.CooldownMinutes):HH:mm:ss}", LogLevel.Info);
+                    return;
+                }
+
+                _systemLogs?.Append($"✅ No open positions detected", LogLevel.Success);
+                _systemLogs?.Append($"🔄 Starting new trade cycle...", LogLevel.Info);
+
+                // Refresh data
+                await RefreshAccount();
+                await RefreshTopCoins();
+
+                // Execute trade
+                await ExecuteTradeAsync();
+
+                _systemLogs?.Append($"", LogLevel.Info);
+                _systemLogs?.Append($"📅 Next trade check: {DateTime.Now.AddMinutes(_settings.CooldownMinutes):HH:mm:ss}", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                _systemLogs?.Append($"", LogLevel.Error);
+                _systemLogs?.Append($"❌ Trade tick error: {ex.Message}", LogLevel.Error);
+                _systemLogs?.Append($"   {ex.StackTrace}", LogLevel.Debug);
+            }
+        }
+
         // ---------------- Data pushes ----------------
         private async Task RefreshTopCoins()
         {
@@ -408,19 +449,22 @@ namespace torra_watch
                 var lookback = TimeSpan.FromHours(lookbackHours);
 
                 var movers = await _market.GetTopMoversAsync(_cfg.UniverseSize, lookback, _cts.Token);
-                var vms = movers.Select(m => new TopCoinVM
-                {
-                    Symbol = m.Symbol,
-                    Price = m.Now,
-                    ChangePct = m.ChangePct
-                }).ToArray();
+
+                var vms = movers
+                    .OrderBy(m => m.ChangePct)
+                    .Select(m => new TopCoinVM
+                    {
+                        Symbol = m.Symbol,
+                        Price = m.Now,
+                        ChangePct = m.ChangePct
+                    }).ToArray();
 
                 void Apply() => _topCoins.SetCoins(vms, lookbackHours);
                 if (InvokeRequired) BeginInvoke((Action)Apply); else Apply();
             }
             catch (Exception ex)
             {
-                _systemLogs?.Append($"❌ RefreshTopCoins: {ex.Message}");
+                _systemLogs?.Append($"❌ RefreshTopCoins: {ex.Message}", LogLevel.Error);
             }
         }
 
@@ -431,9 +475,8 @@ namespace torra_watch
             try
             {
                 var snap = await _account.GetBalancesAsync(_cts.Token);
-                var openOrders = await _account.GetOpenOrdersAsync(_cts.Token); // IReadOnlyList<OpenOrder>
+                var openOrders = await _account.GetOpenOrdersAsync(_cts.Token);
 
-                // Map OpenOrder -> Position (group per symbol, derive Entry/TP/SL)
                 var positions = openOrders
                     .GroupBy(o => o.Symbol, StringComparer.OrdinalIgnoreCase)
                     .Select(g =>
@@ -464,30 +507,228 @@ namespace torra_watch
             }
             catch (Exception ex)
             {
-                _systemLogs?.Append($"❌ RefreshAccount: {ex.Message}");
+                _systemLogs?.Append($"❌ RefreshAccount: {ex.Message}", LogLevel.Error);
             }
         }
 
-        private async void LoadChart(string symbol)
+        // ============================================
+        // ⭐ AUTOMATED TRADING LOGIC
+        // ============================================
+
+        private async Task ExecuteTradeAsync()
         {
+            if (_account == null)
+            {
+                _systemLogs?.Append("❌ Cannot trade: No account connection", LogLevel.Error);
+                return;
+            }
+
             try
             {
-                var candles = await _market.GetKlinesAsync(symbol, "1m", 180, _cts.Token);
+                _systemLogs?.Append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
+                _systemLogs?.Append("🤖 Starting Automated Trade...", LogLevel.Info);
+                _systemLogs?.Append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
 
-                // Uncomment this when PriceChartControl has Draw(string, IReadOnlyList<Candle>) implemented
-                // void Apply() => _priceChart.Draw(symbol, candles);
-                // if (InvokeRequired) BeginInvoke((Action)Apply); else Apply();
+                var lookbackHours = Math.Max(1, _settings.LookbackMinutes / 60);
+                var lookback = TimeSpan.FromHours(lookbackHours);
+
+                var movers = await _market.GetTopMoversAsync(_cfg.UniverseSize, lookback, _cts.Token);
+
+                if (movers.Count < 2)
+                {
+                    _systemLogs?.Append("❌ Not enough coins to trade (need at least 2)", LogLevel.Error);
+                    return;
+                }
+
+                var targetCoin = movers[1];
+                var symbol = targetCoin.Symbol + "USDT";
+                var currentPrice = targetCoin.Now;
+
+                _systemLogs?.Append($"", LogLevel.Info);
+                _systemLogs?.Append($"🎯 Target: {targetCoin.Symbol} at ${currentPrice:N6} ({targetCoin.ChangePct:N2}%)", LogLevel.Success);
+
+                var symbolInfo = await _market.GetExchangeInfoAsync(symbol, _cts.Token);
+                if (symbolInfo == null)
+                {
+                    _systemLogs?.Append($"❌ Could not get trading rules for {symbol}", LogLevel.Error);
+                    return;
+                }
+
+                var accountSnap = await _account.GetBalancesAsync(_cts.Token);
+                var usdtBalance = accountSnap.Balances
+                    .FirstOrDefault(b => b.Asset.Equals("USDT", StringComparison.OrdinalIgnoreCase))
+                    ?.Qty ?? 0m;
+
+                if (usdtBalance < symbolInfo.MinNotional)
+                {
+                    _systemLogs?.Append($"❌ Insufficient USDT: ${usdtBalance:N2}", LogLevel.Error);
+                    return;
+                }
+
+                var usdtToSpend = usdtBalance * 0.99m;
+                var rawQuantity = usdtToSpend / currentPrice;
+                var quantity = RoundToStepSize(rawQuantity, symbolInfo.StepSize, symbolInfo.MinQty);
+
+                _systemLogs?.Append($"🛒 Placing MARKET BUY: {quantity} {targetCoin.Symbol}", LogLevel.Warning);
+
+                var buyOrder = await _account.PlaceMarketBuyAsync(symbol, quantity, _cts.Token);
+
+                if (buyOrder == null)
+                {
+                    _systemLogs?.Append("❌ Buy order failed", LogLevel.Error);
+                    return;
+                }
+
+                _systemLogs?.Append($"✅ BUY FILLED: {buyOrder.ExecutedQty} @ ${buyOrder.AvgPrice:N6}", LogLevel.Success);
+
+                var entryPrice = buyOrder.AvgPrice;
+                var boughtQuantity = buyOrder.ExecutedQty;
+
+                _systemLogs?.Append($"⏳ Waiting for balance to settle...", LogLevel.Warning);
+                await Task.Delay(3000, _cts.Token);
+
+                int retryCount = 0;
+                decimal coinBalance = 0m;
+
+                while (retryCount < 3)
+                {
+                    var updatedAccount = await _account.GetBalancesAsync(_cts.Token);
+                    coinBalance = updatedAccount.Balances
+                        .FirstOrDefault(b => b.Asset.Equals(targetCoin.Symbol, StringComparison.OrdinalIgnoreCase))
+                        ?.Qty ?? 0m;
+
+                    if (coinBalance >= boughtQuantity * 0.99m) break;
+
+                    retryCount++;
+                    if (retryCount < 3) await Task.Delay(2000, _cts.Token);
+                }
+
+                if (coinBalance < boughtQuantity)
+                {
+                    boughtQuantity = RoundToStepSize(coinBalance, symbolInfo.StepSize, symbolInfo.MinQty);
+                }
+
+                var takeProfitPrice = entryPrice * 1.02m;
+                var stopLossPrice = entryPrice * 0.98m;
+
+                if (symbolInfo.TickSize > 0)
+                {
+                    takeProfitPrice = RoundToTickSize(takeProfitPrice, symbolInfo.TickSize);
+                    stopLossPrice = RoundToTickSize(stopLossPrice, symbolInfo.TickSize);
+                }
+                else
+                {
+                    takeProfitPrice = RoundPrice(takeProfitPrice, symbolInfo.PricePrecision);
+                    stopLossPrice = RoundPrice(stopLossPrice, symbolInfo.PricePrecision);
+                }
+
+                var stopLimitPrice = stopLossPrice - symbolInfo.TickSize;
+                if (stopLimitPrice < symbolInfo.MinPrice) stopLimitPrice = symbolInfo.MinPrice;
+
+                _systemLogs?.Append($"📝 Placing OCO: TP=${takeProfitPrice:N6} SL=${stopLossPrice:N6}", LogLevel.Warning);
+
+                await _account.PlaceOcoOrderAsync(symbol, boughtQuantity, takeProfitPrice, stopLossPrice, stopLimitPrice, _cts.Token);
+
+                _systemLogs?.Append($"✅ OCO PLACED! Trade complete.", LogLevel.Success);
+                _systemLogs?.Append($"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
+
+                await RefreshAccount();
             }
             catch (Exception ex)
             {
-                _systemLogs?.Append($"❌ LoadChart: {ex.Message}");
+                _systemLogs?.Append($"❌ TRADE ERROR: {ex.Message}", LogLevel.Error);
             }
         }
 
-        // ---------------- Creds helper ----------------
-        // Replace your BinanceCreds class with this version:
+        // Helper methods
+        private decimal RoundToStepSize(decimal quantity, decimal stepSize, decimal minQty)
+        {
+            if (stepSize == 0) return Math.Round(quantity, 8);
+            var rounded = Math.Floor(quantity / stepSize) * stepSize;
+            if (rounded < minQty) rounded = minQty;
+            return rounded;
+        }
 
-        // Replace your BinanceCreds class with this version:
+        private decimal RoundPrice(decimal price, int precision)
+        {
+            return Math.Round(price, precision, MidpointRounding.AwayFromZero);
+        }
+
+        private decimal RoundToTickSize(decimal price, decimal tickSize)
+        {
+            if (tickSize == 0) return price;
+            return Math.Round(price / tickSize) * tickSize;
+        }
+
+        // ---------------- Diagnostics (for testing) ----------------
+        private async void DiagnoseAccountMismatch()
+        {
+            _systemLogs?.Append("=== ACCOUNT DIAGNOSIS ===", LogLevel.Info);
+
+            var key = Environment.GetEnvironmentVariable("TORRA_BINANCE_KEY") ?? "";
+            var secret = Environment.GetEnvironmentVariable("TORRA_BINANCE_SECRET") ?? "";
+
+            if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(secret))
+            {
+                _systemLogs?.Append("No API keys found!", LogLevel.Error);
+                return;
+            }
+
+            var endpoints = new[]
+            {
+                ("LIVE", "https://api.binance.com"),
+                ("TESTNET", "https://testnet.binance.vision")
+            };
+
+            foreach (var (name, baseUrl) in endpoints)
+            {
+                _systemLogs?.Append($"\n--- Testing {name} ---", LogLevel.Info);
+
+                try
+                {
+                    using var http = new HttpClient { BaseAddress = new Uri(baseUrl), Timeout = TimeSpan.FromSeconds(10) };
+                    http.DefaultRequestHeaders.Add("X-MBX-APIKEY", key);
+
+                    var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    var queryString = $"timestamp={timestamp}";
+
+                    using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+                    var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(queryString));
+                    var signature = BitConverter.ToString(hash).Replace("-", "").ToLower();
+
+                    var accountUrl = $"/api/v3/account?{queryString}&signature={signature}";
+                    var response = await http.GetAsync(accountUrl);
+                    var content = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        _systemLogs?.Append($"✓ {name} SUCCESS", LogLevel.Success);
+                        var json = JsonDocument.Parse(content);
+                        if (json.RootElement.TryGetProperty("balances", out var balances))
+                        {
+                            decimal totalUsdt = 0;
+                            foreach (var bal in balances.EnumerateArray())
+                            {
+                                var asset = bal.GetProperty("asset").GetString() ?? "";
+                                var free = decimal.Parse(bal.GetProperty("free").GetString() ?? "0");
+                                if (asset == "USDT") totalUsdt = free;
+                            }
+                            _systemLogs?.Append($"  USDT: {totalUsdt:F2}", LogLevel.Info);
+                        }
+                    }
+                    else
+                    {
+                        _systemLogs?.Append($"✗ {name} FAILED: {response.StatusCode}", LogLevel.Error);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _systemLogs?.Append($"✗ {name} error: {ex.Message}", LogLevel.Error);
+                }
+            }
+
+            _systemLogs?.Append("\n=== DIAGNOSIS COMPLETE ===", LogLevel.Info);
+        }
 
         public static class BinanceCreds
         {
@@ -497,52 +738,9 @@ namespace torra_watch
                 secret = Environment.GetEnvironmentVariable("TORRA_BINANCE_SECRET") ?? "";
                 mode = (Environment.GetEnvironmentVariable("TORRA_BINANCE_MODE") ?? "live").ToLowerInvariant();
 
-                // Log what we found
-                logger?.Append("Checking Binance credentials...", LogLevel.Info);
-                logger?.Append($"TORRA_BINANCE_KEY: {(string.IsNullOrWhiteSpace(key) ? "NOT SET" : $"SET (length: {key.Length})")}", LogLevel.Debug);
-                logger?.Append($"TORRA_BINANCE_SECRET: {(string.IsNullOrWhiteSpace(secret) ? "NOT SET" : $"SET (length: {secret.Length})")}", LogLevel.Debug);
-                logger?.Append($"TORRA_BINANCE_MODE: {mode}", LogLevel.Debug);
+                logger?.Append($"Binance credentials: {(string.IsNullOrWhiteSpace(key) ? "NOT FOUND" : "LOADED")}", LogLevel.Info);
 
-                // Optional fallback to BotSettings if you store them there
-                try
-                {
-                    if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(secret))
-                    {
-                        logger?.Append("Environment variables not found, trying BotSettings fallback...", LogLevel.Warning);
-                        var s = BotSettings.LoadOrDefault();
-
-                        // Uncomment these if you want to use BotSettings fallback:
-                        // if (string.IsNullOrWhiteSpace(key)) key = s.BinanceApiKey ?? "";
-                        // if (string.IsNullOrWhiteSpace(secret)) secret = s.BinanceApiSecret ?? "";
-                        // if (string.IsNullOrWhiteSpace(mode)) mode = s.BinanceMode ?? "live";
-
-                        logger?.Append($"BotSettings - Key: {(string.IsNullOrWhiteSpace(key) ? "NOT SET" : "SET")}", LogLevel.Debug);
-                        logger?.Append($"BotSettings - Secret: {(string.IsNullOrWhiteSpace(secret) ? "NOT SET" : "SET")}", LogLevel.Debug);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    logger?.Append($"Error loading BotSettings: {ex.Message}", LogLevel.Error);
-                }
-
-                bool result = !(string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(secret));
-
-                if (!result)
-                {
-                    logger?.Append("Binance API keys not found. Running without account sync.", LogLevel.Warning);
-                }
-                else
-                {
-                    var modeDisplay = mode switch
-                    {
-                        "demo" => "Demo (demo.binance.com)",
-                        "testnet" => "Testnet",
-                        _ => "Live Production"
-                    };
-                    logger?.Append($"Binance credentials loaded successfully (Mode: {modeDisplay})", LogLevel.Success);
-                }
-
-                return result;
+                return !string.IsNullOrWhiteSpace(key) && !string.IsNullOrWhiteSpace(secret);
             }
         }
 
@@ -553,6 +751,7 @@ namespace torra_watch
                 _cts.Cancel();
                 _scanTimer?.Dispose();
                 _accountTimer?.Dispose();
+                _tradeTimer?.Dispose();  // ⭐ DISPOSE TRADE TIMER
             }
             base.Dispose(disposing);
         }

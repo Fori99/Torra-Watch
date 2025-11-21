@@ -1,9 +1,5 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Text;
-using System.Windows.Forms;
-using System.Drawing;
 using torra_watch.UI.ViewModels;
 
 namespace torra_watch.UI.Controls

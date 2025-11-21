@@ -1,13 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Windows.Forms;
-using torra_watch.UI.ViewModels;
+﻿using torra_watch.UI.ViewModels;
 
 
 namespace torra_watch.UI.Controls
@@ -17,7 +8,7 @@ namespace torra_watch.UI.Controls
     /// Fields: Universe size, Min drop (3h) %, Take profit %, Stop loss %, Cooldown (minutes).
     /// Exposes SaveRequested and ResetRequested events.
     /// </summary>
-    
+
     public partial class SettingsPanelControl : UserControl
     {
         // Events
@@ -192,5 +183,5 @@ namespace torra_watch.UI.Controls
         }
     }
 }
-    
+
 

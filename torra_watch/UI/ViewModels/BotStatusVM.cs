@@ -1,10 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
-namespace torra_watch.UI.ViewModels
+﻿namespace torra_watch.UI.ViewModels
 {
     public enum BotPrimaryStatus { Stopped, Starting, Running, Stopping, Panic, Error, CoolingDown }
     public enum BotCycleStep
@@ -19,7 +13,7 @@ namespace torra_watch.UI.ViewModels
         Restart
     }
 
-    public  class BotStatusVM
+    public class BotStatusVM
     {
         public BotPrimaryStatus Primary { get; init; } = BotPrimaryStatus.Stopped;
         public BotCycleStep Step { get; init; } = BotCycleStep.None;

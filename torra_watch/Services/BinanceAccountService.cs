@@ -14,11 +14,12 @@ namespace torra_watch.Services
         {
             _signed = signed;
             _http = httpPublic;
-            _http.BaseAddress ??= new Uri("https://api.binance.com");
-            _http.Timeout = TimeSpan.FromSeconds(15);
+            _http.BaseAddress ??= new System.Uri("https://api.binance.com");
+            _http.Timeout = System.TimeSpan.FromSeconds(15);
         }
 
-        // ---- IAccountService ----
+        // ---- IAccountService Implementation ----
+
         public async Task<AccountSnapshot> GetBalancesAsync(CancellationToken ct)
         {
             // 1) signed /api/v3/account -> balances
@@ -30,12 +31,10 @@ namespace torra_watch.Services
                           ?? new List<TickerPrice>();
 
             // Build symbol->price for USDT pairs
-            // Build symbol->price for USDT pairs
             var usdtMap = tickers
-                .Where(t => t.symbol.EndsWith("USDT", StringComparison.OrdinalIgnoreCase))
-                .ToDictionary(t => t.symbol, t => t.price, StringComparer.OrdinalIgnoreCase);
+                .Where(t => t.symbol.EndsWith("USDT", System.StringComparison.OrdinalIgnoreCase))
+                .ToDictionary(t => t.symbol, t => t.price, System.StringComparer.OrdinalIgnoreCase);
 
-            // NOTE: use your existing Models.Balance, not AssetBalance
             var balances = new List<Balance>();
 
             foreach (var b in acc.balances)
@@ -46,7 +45,7 @@ namespace torra_watch.Services
                 if (qty == 0m) continue;
 
                 decimal estUsdt = 0m;
-                if (!string.Equals(b.asset, "USDT", StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(b.asset, "USDT", System.StringComparison.OrdinalIgnoreCase))
                 {
                     var pair = b.asset + "USDT";
                     if (usdtMap.TryGetValue(pair, out var px))
@@ -60,7 +59,7 @@ namespace torra_watch.Services
                 balances.Add(new Balance
                 {
                     Asset = b.asset,
-                    Qty = qty,       // <-- your model likely has Qty
+                    Qty = qty,
                     EstUsdt = estUsdt
                 });
             }
@@ -70,23 +69,14 @@ namespace torra_watch.Services
 
             return new AccountSnapshot
             {
-                TotalUsdt = decimal.Round(total, 2, MidpointRounding.AwayFromZero),
+                TotalUsdt = decimal.Round(total, 2, System.MidpointRounding.AwayFromZero),
                 Balances = balances
             };
-
         }
 
-        // If your interface expects only (CancellationToken), provide that signature
-        public Task<IReadOnlyList<OpenOrder>> GetOpenOrdersAsync(CancellationToken ct)
-            => GetOpenOrdersAsyncInternal(null, ct);
-
-        // You can keep an internal method with symbol filtering if you need it
-        private async Task<IReadOnlyList<OpenOrder>> GetOpenOrdersAsyncInternal(string? symbol, CancellationToken ct)
+        public async Task<IReadOnlyList<OpenOrder>> GetOpenOrdersAsync(CancellationToken ct)
         {
-            var q = new Dictionary<string, string?>();
-            if (!string.IsNullOrWhiteSpace(symbol)) q["symbol"] = symbol;
-
-            var raw = await _signed.GetSignedAsync<List<OpenOrderDto>>("/api/v3/openOrders", q, ct)
+            var raw = await _signed.GetSignedAsync<List<OpenOrderDto>>("/api/v3/openOrders", new Dictionary<string, string?>(), ct)
                       ?? new List<OpenOrderDto>();
 
             return raw.Select(o => new OpenOrder
@@ -97,11 +87,72 @@ namespace torra_watch.Services
                 Price = ToDec(o.price),
                 OrigQty = ToDec(o.origQty),
                 ExecutedQty = ToDec(o.executedQty),
-                TimeUtc = DateTimeOffset.FromUnixTimeMilliseconds(o.time).UtcDateTime
+                TimeUtc = System.DateTimeOffset.FromUnixTimeMilliseconds(o.time).UtcDateTime
             }).ToList();
         }
 
-        // ---- DTOs (class, not record, so we get parameterless ctor + Web naming) ----
+        public async Task<BuyOrderResult> PlaceMarketBuyAsync(string symbol, decimal quantity, CancellationToken ct)
+        {
+            var parameters = new Dictionary<string, string?>
+            {
+                ["symbol"] = symbol,
+                ["side"] = "BUY",
+                ["type"] = "MARKET",
+                ["quantity"] = quantity.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            };
+
+            var response = await _signed.PostSignedAsync<OrderResponseDto>("/api/v3/order", parameters, ct);
+
+            if (response == null)
+                throw new System.Exception("Order response was null");
+
+            // Calculate average price from fills
+            decimal totalQty = 0m;
+            decimal totalCost = 0m;
+
+            foreach (var fill in response.fills ?? new List<FillDto>())
+            {
+                var fillQty = ToDec(fill.qty);
+                var fillPrice = ToDec(fill.price);
+                totalQty += fillQty;
+                totalCost += fillQty * fillPrice;
+            }
+
+            var avgPrice = totalQty > 0 ? totalCost / totalQty : 0m;
+
+            return new BuyOrderResult
+            {
+                Symbol = response.symbol,
+                ExecutedQty = ToDec(response.executedQty),
+                AvgPrice = avgPrice,
+                OrderId = response.orderId.ToString()
+            };
+        }
+
+        public async Task PlaceOcoOrderAsync(
+            string symbol,
+            decimal quantity,
+            decimal takeProfitPrice,
+            decimal stopLossPrice,
+            decimal stopLimitPrice,
+            CancellationToken ct)
+        {
+            var parameters = new Dictionary<string, string?>
+            {
+                ["symbol"] = symbol,
+                ["side"] = "SELL",
+                ["quantity"] = quantity.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["price"] = takeProfitPrice.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["stopPrice"] = stopLossPrice.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["stopLimitPrice"] = stopLimitPrice.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["stopLimitTimeInForce"] = "GTC"
+            };
+
+            await _signed.PostSignedAsync<OcoResponseDto>("/api/v3/order/oco", parameters, ct);
+        }
+
+        // ---- DTOs ----
+
         private sealed class AccountDto
         {
             public List<Bal> balances { get; set; } = new();
@@ -129,6 +180,30 @@ namespace torra_watch.Services
             public string origQty { get; set; } = "0";
             public string executedQty { get; set; } = "0";
             public long time { get; set; }
+        }
+
+        private sealed class OrderResponseDto
+        {
+            public string symbol { get; set; } = "";
+            public long orderId { get; set; }
+            public string executedQty { get; set; } = "0";
+            public string status { get; set; } = "";
+            public List<FillDto>? fills { get; set; }
+        }
+
+        private sealed class FillDto
+        {
+            public string price { get; set; } = "0";
+            public string qty { get; set; } = "0";
+            public string commission { get; set; } = "0";
+            public string commissionAsset { get; set; } = "";
+        }
+
+        private sealed class OcoResponseDto
+        {
+            public long orderListId { get; set; }
+            public string listClientOrderId { get; set; } = "";
+            public string listOrderStatus { get; set; } = "";
         }
 
         private static decimal ToDec(string s) =>

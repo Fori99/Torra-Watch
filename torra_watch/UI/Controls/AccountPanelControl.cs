@@ -1,12 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Windows.Forms;
+﻿using System.Data;
 using torra_watch.Models;
 using torra_watch.UI.ViewModels;
 
@@ -14,71 +6,62 @@ namespace torra_watch.UI.Controls
 {
     public partial class AccountPanelControl : UserControl
     {
-        private readonly Label _lblHeader = new();   // “Main Balance”
-        private readonly Label _lblUsdt = new();   // big USDT value
-        private readonly Label _lblTotal = new();   // “Total = … USDT” (optional)
+        private readonly Label _lblHeader = new();
+        private readonly Label _lblUsdt = new();
+        private readonly Label _lblTotal = new();
         private readonly DataGridView _grid = new();
 
-        private readonly BindingSource _bs = new();          // AccountVM
-        private readonly BindingSource _bsHoldings = new();  // List<HoldingVM>
+        private readonly BindingSource _bs = new();
+        private readonly BindingSource _bsHoldings = new();
 
-        // Optional backing fields if you want to reuse data later
         private decimal _totalUsdt;
         private List<Balance> _balances = new();
         private List<Position> _positions = new();
-
-        // TODO: point these to your real UI elements
-        // If you already have labels/grids with other names, change them here.
-        private Label? _lblTotalUsdt;        // e.g., the big "85,230.00 USDT" label
-        private DataGridView? _gridBalances; // table for balances
-        private DataGridView? _gridOrders;   // table for open orders/positions
 
         /// <summary>Update the big total balance number.</summary>
         public void SetTotalUsdt(decimal totalUsdt)
         {
             _totalUsdt = totalUsdt;
-            // if you have a label in the designer named lblTotalUsdt, assign it to _lblTotalUsdt in ctor.
-            if (_lblTotalUsdt != null)
-                _lblTotalUsdt.Text = $"{totalUsdt:N2} USDT";
-            // otherwise do nothing; you can wire it later.
+
+            // Update the actual labels that exist!
+            _lblUsdt.Text = $"{totalUsdt:N2} USDT";
+            _lblTotal.Text = $"Total: {totalUsdt:N2} USDT";
+
+            // Force refresh
+            _lblUsdt.Invalidate();
+            _lblTotal.Invalidate();
         }
 
+        /// <summary>Replace the balances table.</summary>
         /// <summary>Replace the balances table.</summary>
         public void SetBalances(IEnumerable<Balance> balances)
         {
             _balances = balances?.ToList() ?? new List<Balance>();
-            if (_gridBalances != null)
+
+            // Convert Balance to HoldingVM format that the grid expects
+            var holdings = _balances.Select(b => new HoldingVM
             {
-                // Simple bind; you can style the grid elsewhere
-                _gridBalances.AutoGenerateColumns = true;
-                _gridBalances.DataSource = _balances
-                    .Select(b => new
-                    {
-                        Asset = b.Asset,
-                        Qty = b.Qty,
-                        EstUSDT = Math.Round(b.EstUsdt, 2)
-                    })
-                    .ToList();
-            }
+                Asset = b.Asset,
+                Free = b.Qty,
+                Locked = 0m,
+                // Total is calculated automatically (Free + Locked)
+                EstUsdt = Math.Round(b.EstUsdt, 2),
+                PercentOfTotal = _totalUsdt > 0 ? Math.Round(b.EstUsdt / _totalUsdt * 100m, 2) : 0
+            }).ToList();
+
+            _bsHoldings.DataSource = holdings;
+            _bsHoldings.ResetBindings(false);
+            _grid.ClearSelection();
+            _grid.CurrentCell = null;
+            _grid.Refresh();
         }
 
         /// <summary>Replace the open orders/positions table.</summary>
         public void SetOpenOrders(IEnumerable<Position> positions)
         {
             _positions = positions?.ToList() ?? new List<Position>();
-            if (_gridOrders != null)
-            {
-                _gridOrders.AutoGenerateColumns = true;
-                _gridOrders.DataSource = _positions
-                    .Select(p => new
-                    {
-                        Symbol = p.Symbol,
-                        Entry = p.Price,
-                        TP = p.TakeProfit,
-                        SL = p.StopLoss
-                    })
-                    .ToList();
-            }
+            // Note: You don't have a grid for positions in this control yet
+            // If you want to show positions, you'll need to add another grid
         }
 
         public AccountPanelControl()
@@ -140,25 +123,21 @@ namespace torra_watch.UI.Controls
             _grid.ColumnHeadersHeight = 34;
             _grid.RowTemplate.Height = 28;
 
-            // Make it display-only
             _grid.ReadOnly = true;
             _grid.TabStop = false;
             _grid.MultiSelect = false;
             _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
 
-            // Kill selection colors (match normal colors)
             _grid.DefaultCellStyle.SelectionBackColor = Color.White;
             _grid.DefaultCellStyle.SelectionForeColor = _grid.DefaultCellStyle.ForeColor;
             _grid.AlternatingRowsDefaultCellStyle.SelectionBackColor = _grid.AlternatingRowsDefaultCellStyle.BackColor;
             _grid.AlternatingRowsDefaultCellStyle.SelectionForeColor = _grid.DefaultCellStyle.ForeColor;
 
-            // Never show a selected row
             _grid.SelectionChanged += (_, __) => _grid.ClearSelection();
 
-            // Apply theme
             ApplyGridTheme(_grid);
 
-            // Columns (Asset · Qty · Est. USDT)
+            // Columns
             _grid.Columns.Clear();
             _grid.Columns.Add(new DataGridViewTextBoxColumn
             {
@@ -191,7 +170,6 @@ namespace torra_watch.UI.Controls
 
             _grid.DataSource = _bsHoldings;
 
-            // Compose
             Controls.Add(_grid);
             Controls.Add(top);
         }
@@ -204,7 +182,7 @@ namespace torra_watch.UI.Controls
             _lblTotal.Text = $"Total: {vm.TotalUsdt:N2} USDT";
 
             _grid.ClearSelection();
-            _grid.CurrentCell = null; // ensure no focus cell
+            _grid.CurrentCell = null;
         }
 
         /// <summary> Optional: show some fake data while wiring things. </summary>
@@ -226,12 +204,11 @@ namespace torra_watch.UI.Controls
 
         private static void ApplyGridTheme(DataGridView g)
         {
-            // Colors (match your card header/borders)
-            var headerBg = Color.FromArgb(248, 249, 251); // #F8F9FB
-            var headerText = Color.FromArgb(60, 66, 72);    // #3C4248
-            var gridLines = Color.FromArgb(234, 236, 239); // soft separators
-            var altRowBg = Color.FromArgb(249, 250, 252); // very light gray
-            var selBg = Color.FromArgb(233, 245, 238); // subtle greenish (fits Start/Success)
+            var headerBg = Color.FromArgb(248, 249, 251);
+            var headerText = Color.FromArgb(60, 66, 72);
+            var gridLines = Color.FromArgb(234, 236, 239);
+            var altRowBg = Color.FromArgb(249, 250, 252);
+            var selBg = Color.FromArgb(233, 245, 238);
             var selText = Color.FromArgb(21, 87, 36);
 
             g.EnableHeadersVisualStyles = false;
@@ -265,6 +242,5 @@ namespace torra_watch.UI.Controls
             g.RowHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
             g.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
         }
-
     }
 }
