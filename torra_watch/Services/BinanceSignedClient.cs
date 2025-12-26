@@ -16,6 +16,12 @@ namespace torra_watch.Services
         private readonly string _baseUrl;
         private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
+        // Time sync fields
+        private long _serverTimeOffsetMs = 0;
+        private DateTime _lastTimeSyncUtc = DateTime.MinValue;
+        private readonly TimeSpan _timeSyncInterval = TimeSpan.FromMinutes(30);
+        private const int RecvWindowMs = 5000; // 5 second tolerance
+
         // Updated BinanceSignedClient with api.binance.com support
 
         public BinanceSignedClient(HttpClient http, string apiKey, string apiSecret, string mode, SystemLogsControl? logger = null)
@@ -47,6 +53,63 @@ namespace torra_watch.Services
                 _logger?.Append("Using DEMO mode with api.binance.com", LogLevel.Info);
                 _logger?.Append("Trades will appear on demo.binance.com web interface", LogLevel.Info);
             }
+        }
+
+        /// <summary>
+        /// Syncs local time with Binance server time to prevent timestamp errors.
+        /// Called automatically before signed requests if needed.
+        /// </summary>
+        private async Task SyncTimeIfNeededAsync(CancellationToken ct)
+        {
+            // Skip if we synced recently
+            if (DateTime.UtcNow - _lastTimeSyncUtc < _timeSyncInterval && _serverTimeOffsetMs != 0)
+                return;
+
+            try
+            {
+                var localTimeBefore = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var response = await _http.GetAsync("/api/v3/time", ct);
+                var content = await response.Content.ReadAsStringAsync(ct);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    using var doc = JsonDocument.Parse(content);
+                    if (doc.RootElement.TryGetProperty("serverTime", out var serverTimeProp))
+                    {
+                        var serverTimeMs = serverTimeProp.GetInt64();
+                        var localTimeAfter = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                        // Use average of before/after to account for network latency
+                        var localTimeAvg = (localTimeBefore + localTimeAfter) / 2;
+                        _serverTimeOffsetMs = serverTimeMs - localTimeAvg;
+                        _lastTimeSyncUtc = DateTime.UtcNow;
+
+                        _logger?.Append($"Time synced with Binance (offset: {_serverTimeOffsetMs}ms)", LogLevel.Debug);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.Append($"Time sync failed: {ex.Message}", LogLevel.Warning);
+                // Continue with current offset (or 0 if first time)
+            }
+        }
+
+        /// <summary>
+        /// Forces an immediate time sync with Binance server.
+        /// </summary>
+        public async Task ForceSyncTimeAsync(CancellationToken ct = default)
+        {
+            _lastTimeSyncUtc = DateTime.MinValue; // Force re-sync
+            await SyncTimeIfNeededAsync(ct);
+        }
+
+        /// <summary>
+        /// Gets the current timestamp adjusted for server time offset.
+        /// </summary>
+        private long GetAdjustedTimestamp()
+        {
+            return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + _serverTimeOffsetMs;
         }
 
         /// <summary>
@@ -90,6 +153,9 @@ namespace torra_watch.Services
         {
             try
             {
+                // Sync time with Binance server before making signed request
+                await SyncTimeIfNeededAsync(ct);
+
                 // Build query string from parameters
                 var queryParams = new List<string>();
                 foreach (var param in parameters.Where(p => p.Value != null))
@@ -97,9 +163,10 @@ namespace torra_watch.Services
                     queryParams.Add($"{param.Key}={Uri.EscapeDataString(param.Value!)}");
                 }
 
-                // Add timestamp
-                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                // Add timestamp (adjusted for server time offset) and recvWindow
+                var timestamp = GetAdjustedTimestamp();
                 queryParams.Add($"timestamp={timestamp}");
+                queryParams.Add($"recvWindow={RecvWindowMs}");
 
                 var queryString = string.Join("&", queryParams);
 
@@ -120,8 +187,6 @@ namespace torra_watch.Services
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    _logger?.Append($"API Error {response.StatusCode}: {content}", LogLevel.Error);
-
                     // Parse error for better reporting
                     try
                     {
@@ -131,6 +196,34 @@ namespace torra_watch.Services
                         {
                             var errorCode = code.GetInt32();
                             var errorMsg = msg.GetString();
+
+                            // Handle timestamp error with automatic retry
+                            if (errorCode == -1021)
+                            {
+                                _logger?.Append("Timestamp error detected - forcing time sync and retrying...", LogLevel.Warning);
+                                await ForceSyncTimeAsync(ct);
+
+                                // Rebuild request with new timestamp
+                                queryParams.RemoveAll(p => p.StartsWith("timestamp=") || p.StartsWith("recvWindow="));
+                                timestamp = GetAdjustedTimestamp();
+                                queryParams.Add($"timestamp={timestamp}");
+                                queryParams.Add($"recvWindow={RecvWindowMs}");
+                                queryString = string.Join("&", queryParams);
+                                signature = GenerateSignature(queryString);
+                                queryString = $"{queryString}&signature={signature}";
+                                fullUrl = endpoint.Contains("?") ? $"{endpoint}&{queryString}" : $"{endpoint}?{queryString}";
+
+                                // Retry the request
+                                response = await _http.GetAsync(fullUrl, ct);
+                                content = await response.Content.ReadAsStringAsync(ct);
+
+                                if (response.IsSuccessStatusCode)
+                                {
+                                    return content;
+                                }
+                            }
+
+                            _logger?.Append($"API Error {response.StatusCode}: {content}", LogLevel.Error);
 
                             // Provide specific guidance
                             switch (errorCode)
@@ -142,7 +235,7 @@ namespace torra_watch.Services
                                     _logger?.Append("3. API key has required permissions enabled", LogLevel.Error);
                                     break;
                                 case -1021:
-                                    _logger?.Append("Timestamp error - sync your system clock", LogLevel.Error);
+                                    _logger?.Append("Timestamp error persists - check your system clock", LogLevel.Error);
                                     break;
                                 case -1022:
                                     _logger?.Append("Invalid signature - check your API secret", LogLevel.Error);
@@ -157,6 +250,7 @@ namespace torra_watch.Services
                         // If we can't parse the error, throw with the raw content
                     }
 
+                    _logger?.Append($"API Error {response.StatusCode}: {content}", LogLevel.Error);
                     throw new Exception($"Binance API error: {content}");
                 }
 
@@ -214,6 +308,9 @@ namespace torra_watch.Services
         {
             try
             {
+                // Sync time with Binance server before making signed request
+                await SyncTimeIfNeededAsync(ct);
+
                 // Build form data with parameters
                 var formData = new List<KeyValuePair<string, string>>();
                 foreach (var param in parameters.Where(p => p.Value != null))
@@ -221,9 +318,10 @@ namespace torra_watch.Services
                     formData.Add(new KeyValuePair<string, string>(param.Key, param.Value!));
                 }
 
-                // Add timestamp
-                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                // Add timestamp (adjusted for server time offset) and recvWindow
+                var timestamp = GetAdjustedTimestamp();
                 formData.Add(new KeyValuePair<string, string>("timestamp", timestamp.ToString()));
+                formData.Add(new KeyValuePair<string, string>("recvWindow", RecvWindowMs.ToString()));
 
                 // Generate signature
                 var queryString = string.Join("&", formData.Select(kv => $"{kv.Key}={Uri.EscapeDataString(kv.Value)}"));
@@ -241,6 +339,41 @@ namespace torra_watch.Services
 
                 if (!response.IsSuccessStatusCode)
                 {
+                    // Check for timestamp error and retry
+                    try
+                    {
+                        var errorJson = JsonDocument.Parse(responseContent);
+                        if (errorJson.RootElement.TryGetProperty("code", out var code) && code.GetInt32() == -1021)
+                        {
+                            _logger?.Append("Timestamp error detected - forcing time sync and retrying...", LogLevel.Warning);
+                            await ForceSyncTimeAsync(ct);
+
+                            // Rebuild request with new timestamp
+                            formData = new List<KeyValuePair<string, string>>();
+                            foreach (var param in parameters.Where(p => p.Value != null))
+                            {
+                                formData.Add(new KeyValuePair<string, string>(param.Key, param.Value!));
+                            }
+                            timestamp = GetAdjustedTimestamp();
+                            formData.Add(new KeyValuePair<string, string>("timestamp", timestamp.ToString()));
+                            formData.Add(new KeyValuePair<string, string>("recvWindow", RecvWindowMs.ToString()));
+                            queryString = string.Join("&", formData.Select(kv => $"{kv.Key}={Uri.EscapeDataString(kv.Value)}"));
+                            signature = GenerateSignature(queryString);
+                            formData.Add(new KeyValuePair<string, string>("signature", signature));
+                            content = new FormUrlEncodedContent(formData);
+
+                            // Retry the request
+                            response = await _http.PostAsync(endpoint, content, ct);
+                            responseContent = await response.Content.ReadAsStringAsync(ct);
+
+                            if (response.IsSuccessStatusCode)
+                            {
+                                return responseContent;
+                            }
+                        }
+                    }
+                    catch (JsonException) { }
+
                     _logger?.Append($"API Error {response.StatusCode}: {responseContent}", LogLevel.Error);
                     throw new Exception($"Binance API error: {responseContent}");
                 }
@@ -279,6 +412,9 @@ namespace torra_watch.Services
         {
             try
             {
+                // Sync time with Binance server before making signed request
+                await SyncTimeIfNeededAsync(ct);
+
                 // Build query string
                 var queryParams = new List<string>();
                 foreach (var param in parameters.Where(p => p.Value != null))
@@ -286,9 +422,10 @@ namespace torra_watch.Services
                     queryParams.Add($"{param.Key}={Uri.EscapeDataString(param.Value!)}");
                 }
 
-                // Add timestamp
-                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                // Add timestamp (adjusted for server time offset) and recvWindow
+                var timestamp = GetAdjustedTimestamp();
                 queryParams.Add($"timestamp={timestamp}");
+                queryParams.Add($"recvWindow={RecvWindowMs}");
 
                 var queryString = string.Join("&", queryParams);
 
@@ -309,6 +446,41 @@ namespace torra_watch.Services
 
                 if (!response.IsSuccessStatusCode)
                 {
+                    // Check for timestamp error and retry
+                    try
+                    {
+                        var errorJson = JsonDocument.Parse(content);
+                        if (errorJson.RootElement.TryGetProperty("code", out var code) && code.GetInt32() == -1021)
+                        {
+                            _logger?.Append("Timestamp error detected - forcing time sync and retrying...", LogLevel.Warning);
+                            await ForceSyncTimeAsync(ct);
+
+                            // Rebuild request with new timestamp
+                            queryParams = new List<string>();
+                            foreach (var param in parameters.Where(p => p.Value != null))
+                            {
+                                queryParams.Add($"{param.Key}={Uri.EscapeDataString(param.Value!)}");
+                            }
+                            timestamp = GetAdjustedTimestamp();
+                            queryParams.Add($"timestamp={timestamp}");
+                            queryParams.Add($"recvWindow={RecvWindowMs}");
+                            queryString = string.Join("&", queryParams);
+                            signature = GenerateSignature(queryString);
+                            queryString = $"{queryString}&signature={signature}";
+                            fullUrl = endpoint.Contains("?") ? $"{endpoint}&{queryString}" : $"{endpoint}?{queryString}";
+
+                            // Retry the request
+                            response = await _http.DeleteAsync(fullUrl, ct);
+                            content = await response.Content.ReadAsStringAsync(ct);
+
+                            if (response.IsSuccessStatusCode)
+                            {
+                                return content;
+                            }
+                        }
+                    }
+                    catch (JsonException) { }
+
                     _logger?.Append($"API Error {response.StatusCode}: {content}", LogLevel.Error);
                     throw new Exception($"Binance API error: {content}");
                 }

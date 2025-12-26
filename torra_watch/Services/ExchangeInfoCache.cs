@@ -6,7 +6,7 @@ namespace torra_watch.Services
     /// Caches exchange info (LOT_SIZE, MIN_NOTIONAL, etc.) to avoid repeated API calls.
     /// Cache is refreshed every few hours.
     /// </summary>
-    public class ExchangeInfoCache
+    internal class ExchangeInfoCache
     {
         private readonly IMarketDataService _market;
         private readonly ConcurrentDictionary<string, CachedSymbolInfo> _cache = new(StringComparer.OrdinalIgnoreCase);
