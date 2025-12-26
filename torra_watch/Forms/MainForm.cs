@@ -17,6 +17,7 @@ namespace torra_watch
         private readonly IMarketDataService _market;
         private readonly ISettingsService _settingsSvc;
         private IAccountService? _account;
+        private readonly ExchangeInfoCache _exchangeInfoCache;
 
         private StrategyConfigVM _cfg = StrategyConfigVM.Defaults();
 
@@ -57,6 +58,7 @@ namespace torra_watch
             // Services
             var http = new HttpClient();
             _market = new BinanceMarketDataService(http);
+            _exchangeInfoCache = new ExchangeInfoCache(_market, TimeSpan.FromHours(4));
 
             var httpPublic = new HttpClient();
 
@@ -547,12 +549,15 @@ namespace torra_watch
                 _systemLogs?.Append($"", LogLevel.Info);
                 _systemLogs?.Append($"🎯 Target: {targetCoin.Symbol} at ${currentPrice:N6} ({targetCoin.ChangePct:N2}%)", LogLevel.Success);
 
-                var symbolInfo = await _market.GetExchangeInfoAsync(symbol, _cts.Token);
+                // Use cached exchange info (refreshed every 4 hours)
+                var symbolInfo = await _exchangeInfoCache.GetSymbolInfoAsync(symbol, _cts.Token);
                 if (symbolInfo == null)
                 {
                     _systemLogs?.Append($"❌ Could not get trading rules for {symbol}", LogLevel.Error);
                     return;
                 }
+
+                _systemLogs?.Append($"📋 Symbol filters: stepSize={symbolInfo.StepSize}, minQty={symbolInfo.MinQty}, minNotional={symbolInfo.MinNotional}", LogLevel.Debug);
 
                 var accountSnap = await _account.GetBalancesAsync(_cts.Token);
                 var usdtBalance = accountSnap.Balances
@@ -561,15 +566,23 @@ namespace torra_watch
 
                 if (usdtBalance < symbolInfo.MinNotional)
                 {
-                    _systemLogs?.Append($"❌ Insufficient USDT: ${usdtBalance:N2}", LogLevel.Error);
+                    _systemLogs?.Append($"❌ Insufficient USDT: ${usdtBalance:N2} (min: ${symbolInfo.MinNotional:N2})", LogLevel.Error);
                     return;
                 }
 
-                var usdtToSpend = usdtBalance * 0.99m;
+                // Calculate buy quantity using helper - rounds DOWN to stepSize
+                var usdtToSpend = usdtBalance * 0.99m; // Use 99% to leave room for fees
                 var rawQuantity = usdtToSpend / currentPrice;
-                var quantity = RoundToStepSize(rawQuantity, symbolInfo.StepSize, symbolInfo.MinQty);
 
-                _systemLogs?.Append($"🛒 Placing MARKET BUY: {quantity} {targetCoin.Symbol}", LogLevel.Warning);
+                var buyResult = QuantityHelper.AdjustBuyQuantity(rawQuantity, currentPrice, symbolInfo);
+                if (!buyResult.IsSuccess)
+                {
+                    _systemLogs?.Append($"❌ Cannot buy: {buyResult.ErrorMessage}", LogLevel.Error);
+                    return;
+                }
+
+                var quantity = buyResult.Quantity;
+                _systemLogs?.Append($"🛒 Placing MARKET BUY: {quantity} {targetCoin.Symbol} (~${buyResult.Notional:N2} USDT)", LogLevel.Warning);
 
                 var buyOrder = await _account.PlaceMarketBuyAsync(symbol, quantity, _cts.Token);
 
@@ -582,54 +595,59 @@ namespace torra_watch
                 _systemLogs?.Append($"✅ BUY FILLED: {buyOrder.ExecutedQty} @ ${buyOrder.AvgPrice:N6}", LogLevel.Success);
 
                 var entryPrice = buyOrder.AvgPrice;
-                var boughtQuantity = buyOrder.ExecutedQty;
 
                 _systemLogs?.Append($"⏳ Waiting for balance to settle...", LogLevel.Warning);
                 await Task.Delay(3000, _cts.Token);
 
+                // Get ACTUAL balance for OCO - this is key to preventing dust!
+                // We sell the ENTIRE balance, not the bought quantity
                 int retryCount = 0;
-                decimal coinBalance = 0m;
+                decimal actualCoinBalance = 0m;
 
                 while (retryCount < 3)
                 {
-                    var updatedAccount = await _account.GetBalancesAsync(_cts.Token);
-                    coinBalance = updatedAccount.Balances
-                        .FirstOrDefault(b => b.Asset.Equals(targetCoin.Symbol, StringComparison.OrdinalIgnoreCase))
-                        ?.Qty ?? 0m;
+                    actualCoinBalance = await _account.GetAssetBalanceAsync(targetCoin.Symbol, _cts.Token);
 
-                    if (coinBalance >= boughtQuantity * 0.99m) break;
+                    if (actualCoinBalance >= buyOrder.ExecutedQty * 0.99m) break;
 
                     retryCount++;
+                    _systemLogs?.Append($"   Retry {retryCount}/3 - Balance: {actualCoinBalance}", LogLevel.Debug);
                     if (retryCount < 3) await Task.Delay(2000, _cts.Token);
                 }
 
-                if (coinBalance < boughtQuantity)
+                _systemLogs?.Append($"💰 Actual {targetCoin.Symbol} balance: {actualCoinBalance}", LogLevel.Info);
+
+                // Round DOWN the ACTUAL balance to get sellable quantity - minimizes dust!
+                var sellableQty = QuantityHelper.FloorToStepSize(actualCoinBalance, symbolInfo.StepSize);
+                var dustAfterSell = actualCoinBalance - sellableQty;
+
+                if (sellableQty <= 0 || sellableQty < symbolInfo.MinQty)
                 {
-                    boughtQuantity = RoundToStepSize(coinBalance, symbolInfo.StepSize, symbolInfo.MinQty);
+                    _systemLogs?.Append($"❌ Cannot create OCO: sellable qty {sellableQty} < min {symbolInfo.MinQty}", LogLevel.Error);
+                    return;
                 }
 
-                var takeProfitPrice = entryPrice * 1.02m;
-                var stopLossPrice = entryPrice * 0.98m;
+                _systemLogs?.Append($"📊 Will sell: {sellableQty} (dust remaining: {dustAfterSell})", LogLevel.Info);
 
-                if (symbolInfo.TickSize > 0)
-                {
-                    takeProfitPrice = RoundToTickSize(takeProfitPrice, symbolInfo.TickSize);
-                    stopLossPrice = RoundToTickSize(stopLossPrice, symbolInfo.TickSize);
-                }
-                else
-                {
-                    takeProfitPrice = RoundPrice(takeProfitPrice, symbolInfo.PricePrecision);
-                    stopLossPrice = RoundPrice(stopLossPrice, symbolInfo.PricePrecision);
-                }
+                // Calculate exit prices using helper - properly rounded
+                var (takeProfitPrice, stopLossPrice, stopLimitPrice) = QuantityHelper.CalculateExitPrices(
+                    entryPrice,
+                    _settings.TpPct,
+                    _settings.SlPct,
+                    symbolInfo);
 
-                var stopLimitPrice = stopLossPrice - symbolInfo.TickSize;
-                if (stopLimitPrice < symbolInfo.MinPrice) stopLimitPrice = symbolInfo.MinPrice;
+                _systemLogs?.Append($"📝 Placing OCO with ENTIRE sellable balance:", LogLevel.Warning);
+                _systemLogs?.Append($"   Quantity: {sellableQty} {targetCoin.Symbol}", LogLevel.Info);
+                _systemLogs?.Append($"   Take Profit: ${takeProfitPrice:N6} (+{_settings.TpPct}%)", LogLevel.Info);
+                _systemLogs?.Append($"   Stop Loss: ${stopLossPrice:N6} (-{_settings.SlPct}%)", LogLevel.Info);
 
-                _systemLogs?.Append($"📝 Placing OCO: TP=${takeProfitPrice:N6} SL=${stopLossPrice:N6}", LogLevel.Warning);
-
-                await _account.PlaceOcoOrderAsync(symbol, boughtQuantity, takeProfitPrice, stopLossPrice, stopLimitPrice, _cts.Token);
+                await _account.PlaceOcoOrderAsync(symbol, sellableQty, takeProfitPrice, stopLossPrice, stopLimitPrice, _cts.Token);
 
                 _systemLogs?.Append($"✅ OCO PLACED! Trade complete.", LogLevel.Success);
+                if (dustAfterSell > 0)
+                {
+                    _systemLogs?.Append($"⚠️ Dust remaining: {dustAfterSell} {targetCoin.Symbol} (below stepSize)", LogLevel.Warning);
+                }
                 _systemLogs?.Append($"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", LogLevel.Info);
 
                 await RefreshAccount();
@@ -638,26 +656,6 @@ namespace torra_watch
             {
                 _systemLogs?.Append($"❌ TRADE ERROR: {ex.Message}", LogLevel.Error);
             }
-        }
-
-        // Helper methods
-        private decimal RoundToStepSize(decimal quantity, decimal stepSize, decimal minQty)
-        {
-            if (stepSize == 0) return Math.Round(quantity, 8);
-            var rounded = Math.Floor(quantity / stepSize) * stepSize;
-            if (rounded < minQty) rounded = minQty;
-            return rounded;
-        }
-
-        private decimal RoundPrice(decimal price, int precision)
-        {
-            return Math.Round(price, precision, MidpointRounding.AwayFromZero);
-        }
-
-        private decimal RoundToTickSize(decimal price, decimal tickSize)
-        {
-            if (tickSize == 0) return price;
-            return Math.Round(price / tickSize) * tickSize;
         }
 
         // ---------------- Diagnostics (for testing) ----------------

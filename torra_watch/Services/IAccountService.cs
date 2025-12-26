@@ -39,6 +39,41 @@ namespace torra_watch.Services
             decimal stopLossPrice,
             decimal stopLimitPrice,
             CancellationToken ct);
+
+        /// <summary>
+        /// Get the free balance for a specific asset
+        /// </summary>
+        /// <param name="asset">Asset symbol (e.g., "BTC", "ETH")</param>
+        /// <param name="ct">Cancellation token</param>
+        /// <returns>Free balance available for trading</returns>
+        Task<decimal> GetAssetBalanceAsync(string asset, CancellationToken ct);
+
+        /// <summary>
+        /// Place a market sell order for the entire balance of an asset.
+        /// Gets actual balance, rounds down to stepSize, and sells maximum possible.
+        /// </summary>
+        /// <param name="symbol">Trading pair symbol (e.g., "BTCUSDT")</param>
+        /// <param name="symbolInfo">Symbol trading rules for quantity adjustment</param>
+        /// <param name="ct">Cancellation token</param>
+        /// <returns>Sell order result with executed quantity and price</returns>
+        Task<SellOrderResult> MarketSellEntireBalanceAsync(
+            string symbol,
+            SymbolInfo symbolInfo,
+            CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Result of a market sell order
+    /// </summary>
+    public class SellOrderResult
+    {
+        public string Symbol { get; set; } = "";
+        public decimal ExecutedQty { get; set; }
+        public decimal AvgPrice { get; set; }
+        public decimal DustRemaining { get; set; }
+        public string OrderId { get; set; } = "";
+        public bool Success { get; set; }
+        public string? ErrorMessage { get; set; }
     }
 
     /// <summary>

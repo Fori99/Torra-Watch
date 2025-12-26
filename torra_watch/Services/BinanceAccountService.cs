@@ -151,6 +151,127 @@ namespace torra_watch.Services
             await _signed.PostSignedAsync<OcoResponseDto>("/api/v3/order/oco", parameters, ct);
         }
 
+        public async Task<decimal> GetAssetBalanceAsync(string asset, CancellationToken ct)
+        {
+            var acc = await _signed.GetSignedAsync<AccountDto>("/api/v3/account", new Dictionary<string, string?>(), ct)
+                      ?? new AccountDto();
+
+            var balance = acc.balances.FirstOrDefault(b =>
+                string.Equals(b.asset, asset, System.StringComparison.OrdinalIgnoreCase));
+
+            if (balance == null) return 0m;
+
+            return ToDec(balance.free);
+        }
+
+        public async Task<SellOrderResult> MarketSellEntireBalanceAsync(
+            string symbol,
+            SymbolInfo symbolInfo,
+            CancellationToken ct)
+        {
+            // Extract base asset from symbol (e.g., "BTC" from "BTCUSDT")
+            var baseAsset = symbol.EndsWith("USDT", System.StringComparison.OrdinalIgnoreCase)
+                ? symbol[..^4]
+                : symbol;
+
+            // Get actual balance
+            var actualBalance = await GetAssetBalanceAsync(baseAsset, ct);
+
+            if (actualBalance <= 0)
+            {
+                return new SellOrderResult
+                {
+                    Symbol = symbol,
+                    Success = false,
+                    ErrorMessage = $"No {baseAsset} balance to sell"
+                };
+            }
+
+            // Round DOWN to stepSize to maximize sellable amount
+            var sellableQty = QuantityHelper.FloorToStepSize(actualBalance, symbolInfo.StepSize);
+            var dustRemaining = actualBalance - sellableQty;
+
+            if (sellableQty <= 0)
+            {
+                return new SellOrderResult
+                {
+                    Symbol = symbol,
+                    Success = false,
+                    DustRemaining = actualBalance,
+                    ErrorMessage = $"Balance {actualBalance} rounds to zero with stepSize {symbolInfo.StepSize}"
+                };
+            }
+
+            if (sellableQty < symbolInfo.MinQty)
+            {
+                return new SellOrderResult
+                {
+                    Symbol = symbol,
+                    Success = false,
+                    DustRemaining = actualBalance,
+                    ErrorMessage = $"Sellable qty {sellableQty} is below minimum {symbolInfo.MinQty}"
+                };
+            }
+
+            // Execute market sell
+            var parameters = new Dictionary<string, string?>
+            {
+                ["symbol"] = symbol,
+                ["side"] = "SELL",
+                ["type"] = "MARKET",
+                ["quantity"] = sellableQty.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            };
+
+            try
+            {
+                var response = await _signed.PostSignedAsync<OrderResponseDto>("/api/v3/order", parameters, ct);
+
+                if (response == null)
+                {
+                    return new SellOrderResult
+                    {
+                        Symbol = symbol,
+                        Success = false,
+                        ErrorMessage = "Order response was null"
+                    };
+                }
+
+                // Calculate average price from fills
+                decimal totalQty = 0m;
+                decimal totalValue = 0m;
+
+                foreach (var fill in response.fills ?? new List<FillDto>())
+                {
+                    var fillQty = ToDec(fill.qty);
+                    var fillPrice = ToDec(fill.price);
+                    totalQty += fillQty;
+                    totalValue += fillQty * fillPrice;
+                }
+
+                var avgPrice = totalQty > 0 ? totalValue / totalQty : 0m;
+
+                return new SellOrderResult
+                {
+                    Symbol = symbol,
+                    ExecutedQty = ToDec(response.executedQty),
+                    AvgPrice = avgPrice,
+                    DustRemaining = dustRemaining,
+                    OrderId = response.orderId.ToString(),
+                    Success = true
+                };
+            }
+            catch (System.Exception ex)
+            {
+                return new SellOrderResult
+                {
+                    Symbol = symbol,
+                    Success = false,
+                    DustRemaining = actualBalance,
+                    ErrorMessage = ex.Message
+                };
+            }
+        }
+
         // ---- DTOs ----
 
         private sealed class AccountDto
